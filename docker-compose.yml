@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # LocalStack's community image now requires an account token, so we use
+  # MiniStack (MIT, LocalStack-compatible API on the same port).
+  ministack:
+    image: ministackorg/ministack:1.5.35
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./docker/ministack/ready.d:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      # the image has no curl; queues are created by the ready.d script, so
+      # we only report healthy once the last one exists
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import sys,urllib.request;sys.exit(0 if b'wager-events.fifo' in urllib.request.urlopen('http://localhost:4566/?Action=ListQueues').read() else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
