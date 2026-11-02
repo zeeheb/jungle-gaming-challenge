@@ -13,7 +13,7 @@ src/
     events/         eventos de integração
     messaging/      InboxMessage e OutboxMessage
   application/      casos de uso e portas (UnitOfWork, repositórios): sem NestJS, sem ORM
-  infrastructure/   adaptadores: PostgreSQL (MikroORM) e SQS
+  infrastructure/   adaptadores: PostgreSQL (MikroORM), SQS e observabilidade (logs JSON, Prometheus)
   http/             controllers, contratos de resposta e o filtro de erros
   workers/          laços em segundo plano (consumidor SQS, relay da outbox, referências pendentes) e o desligamento gracioso
   health/           liveness e readiness
@@ -451,4 +451,64 @@ Mutação de controle: sem o lock da wallet no worker, o teste dos três workers
 - **A chegada da referência não acorda quem espera.** O `REFUND` só é reavaliado na próxima consulta agendada, ou seja, até 1 s depois se ele acabou de chegar, ou mais se já esperou várias vezes. Para baixar essa latência, a própria transação que chega poderia antecipar o `next_reference_attempt_at` de quem a referencia; ficou de fora por simplicidade.
 - **Cada rodada processa as transações em sequência.** Com o lote de 20 e o poll de 500 ms, isso sobra para o volume esperado de mensagens fora de ordem. Paralelizar por wallet seria o próximo passo.
 - **A busca inicial não trava nada**, então dois workers podem perder tempo com a mesma linha. O efeito é só desperdício, nunca duplicidade (lock da wallet + releitura + constraints). Um `SKIP LOCKED` nas linhas pendentes evitaria o desperdício, mas traria um segundo tipo de lock (linha da transação antes da wallet) e o risco de inverter a ordem dos locks.
+
+## Extrato e reconciliação
+
+### `GET /wallets/:walletId/ledger?cursor=...&limit=50`
+
+- Lançamentos do mais antigo para o mais novo. O `limit` vai de 1 a 200 (padrão 50).
+- **O cursor é a `wallet_version` do último lançamento visto.** Ela é única por wallet, nunca é reaproveitada, e lançamentos novos sempre ganham versão maior. Por isso uma página já lida nunca muda, e um lançamento que chega durante a paginação aparece no fim, sem pular nem repetir nada (há um teste que insere lançamentos entre as páginas). Um cursor por `OFFSET` falharia exatamente nesse caso.
+- **Opaco:** o cursor é base64url de `{ w: walletId, v: versão }`. O cliente não precisa entendê-lo, e um cursor emitido para uma wallet é recusado em outra (400).
+- A consulta usa o índice `UNIQUE (wallet_id, wallet_version)`: é uma busca por faixa, rápida em qualquer página. A página busca `limit + 1` linhas para saber se existe uma próxima, sem `COUNT`.
+
+### `POST /wallets/:walletId/reconciliation`
+
+- Reconstrói o saldo a partir do ledger (créditos − débitos) e compara com o saldo gravado. A comparação é uma classe do domínio (`WalletReconciliation`).
+- **A wallet fica travada durante a leitura.** Em `READ COMMITTED`, cada instrução vê o último commit; sem o lock, uma aposta confirmada entre a leitura do saldo e a soma do ledger pareceria uma divergência.
+- **Divergência não é corrigida.** Ela aparece na resposta (`consistent: false`, com a diferença), é registrada como log de erro (com `walletId` e a diferença) e conta na métrica `wagering_reconciliations_total{result="inconsistent"}`. Corrigir o saldo sozinho esconderia o que o escreveu errado.
+- O status é 200 nos dois casos: a verificação funcionou, e quem traz o veredito é o campo `consistent`.
+- Créditos e débitos são somados separadamente, então cada soma é um valor não negativo, e mesmo um ledger que não fecha produz uma diferença com sentido.
+- **Como testar uma divergência, se o banco a impede?** O teste contorna os triggers com `SET LOCAL session_replication_role = replica`, como faria uma correção manual descuidada direto no banco (é preciso ser superusuário). Depois confere que a reconciliação acusa a diferença e que o saldo continua errado.
+
+## Observabilidade
+
+### Logs estruturados
+
+- **Uma linha JSON por evento** no stdout (`JsonLogger`), o formato que coletores como CloudWatch, Loki e Datadog leem sem configuração. Ele substitui o logger do Nest, então as mensagens do próprio framework e todo `new Logger(contexto)` do código saem no mesmo formato. O nível é controlado por `LOG_LEVEL`.
+- **Contexto automático:** um `AsyncLocalStorage` (`logContext`) carrega campos que toda linha escrita dentro dele herda, por mais profunda que seja a chamada. O middleware HTTP coloca o `correlationId`, e o consumidor coloca o `sqsMessageId` de cada mensagem.
+- **Campos de identificação:** `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`, `externalTransactionId`.
+- **Sem dados sensíveis:** valores, saldos e `playerId` não vão para o log. Quem precisar dos detalhes consulta a transação pelo id. Há um teste que confere que um log de transação não contém o valor, o saldo nem o player. A única exceção é a diferença de uma reconciliação divergente, que é justamente o que alguém precisa investigar.
+
+### Telemetria como porta
+
+Os casos de uso dizem **o que aconteceu**, em termos de negócio, por uma porta (`Telemetry`: transação decidida, duplicata respondida, conflito de idempotência, referência reavaliada, wallet reconciliada). O adaptador (`ObservedTelemetry`) transforma isso em logs e métricas. Assim a aplicação continua sem depender de Prometheus ou de logger, e os testes de unidade usam `NO_TELEMETRY`. O que é puramente técnico (conflito de lock, retry de mensagem, publicação na fila) é contado direto pela infraestrutura.
+
+### Métricas (`GET /metrics`, formato Prometheus)
+
+| Pedido no enunciado | Métrica |
+|---|---|
+| Transações por status | `wagering_transactions_total{entrypoint, kind, status}`: só decisões novas |
+| Duplicatas detectadas | `wagering_duplicates_total{type="idempotency-key" ou "message"}`, e `wagering_idempotency_conflicts_total` para o mesmo id com outro conteúdo |
+| Retries | `wagering_message_retries_total{code}` e `wagering_reference_retries_total{status}` |
+| Mensagens em DLQ | `wagering_messages_dead_lettered_total{code}`: o que nós movemos; `wagering_dead_letter_queue_messages`: o que está na DLQ agora |
+| Conflitos de lock | `wagering_lock_conflicts_total{reason="lock_timeout", "deadlock" ou "serialization"}` |
+| Outbox lag | `wagering_outbox_pending_messages` e `wagering_outbox_lag_seconds` (idade do evento pendente mais antigo); `wagering_outbox_published_total`, `wagering_outbox_publish_failures_total` |
+| Latência de processamento | `wagering_processing_duration_seconds{entrypoint}` (histograma, com a espera pelo lock incluída) |
+| — | `wagering_reconciliations_total{result}` |
+
+- Cada instância tem o seu próprio `Registry`, e não o global do `prom-client`. No Prometheus, as instâncias se somam pelo rótulo `instance`.
+- **Os gauges de estado** (backlog da outbox, profundidade da DLQ) são lidos **na hora da coleta**, consultando o banco (pelo índice parcial dos pendentes) e o SQS. Se a fonte estiver fora, o valor é `NaN` em vez de um número velho.
+- `/metrics` e `/health` ficam abertos, como o enunciado pede para o health. Em produção, ficariam acessíveis só pela rede interna.
+
+### Testes
+
+- `ledger-and-reconciliation.test.ts`: paginação (inclusive com lançamentos novos no meio), validação de `limit` e de cursor, reconciliação consistente e divergente.
+- `observability.test.ts`: contadores por status, duplicata, conflito, histograma, backlog da outbox, DLQ, conflito de lock.
+- Testes de unidade de `JsonLogger` (formato, contexto, stack, nível, ausência de valores), de `WalletReconciliation` e do cursor.
+
+### Trade-offs e limitações
+
+- **Sem tracing distribuído (OpenTelemetry).** O `correlationId` atravessa HTTP, fila, banco e eventos, o que cobre o diagnóstico do desafio. Spans exigiriam instrumentar Nest, pg e o SDK da AWS.
+- **O histograma de latência mede o caso de uso**, e não a fila: uma mensagem que esperou minutos na fila aparece rápida. A idade da mensagem (agora − `occurredAt`) seria a próxima métrica a acrescentar.
+- **Coletar os gauges consulta o banco e o SQS.** O custo é uma consulta por índice e uma chamada de API por coleta (a cada 15–30 s, tipicamente).
 
