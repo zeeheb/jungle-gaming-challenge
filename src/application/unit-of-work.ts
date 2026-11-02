@@ -1,5 +1,6 @@
 import type { InboxMessage } from '../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../domain/messaging/outbox-message';
+import type { Money } from '../domain/shared/money';
 import type { WagerTransaction } from '../domain/wagering/wager-transaction';
 import type { Wallet } from '../domain/wallet/wallet';
 import type { WalletLedgerEntry } from '../domain/wallet/wallet-ledger-entry';
@@ -32,9 +33,19 @@ export interface WagerTransactionRepository {
   update(transaction: WagerTransaction): void;
 }
 
+/** Sums of a wallet's ledger, each in the wallet's currency. */
+export interface LedgerTotals {
+  credits: Money;
+  debits: Money;
+  entries: number;
+}
+
 export interface LedgerRepository {
   /** The entry's transaction must already be added (or loaded) in this unit of work. */
   add(entry: WalletLedgerEntry): void;
+  /** Entries after `afterVersion`, oldest first. Versions never change, so the order never does. */
+  listByWallet(walletId: string, afterVersion: number, limit: number): Promise<WalletLedgerEntry[]>;
+  totals(walletId: string, currency: string): Promise<LedgerTotals>;
 }
 
 export interface InboxRepository {

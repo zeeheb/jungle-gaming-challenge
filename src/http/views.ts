@@ -1,9 +1,12 @@
 import { HttpStatus } from '@nestjs/common';
 import type { ProcessWagerResult } from '../application/wagering/process-wager-transaction';
+import type { LedgerPage } from '../application/wallets/wallet-queries';
 import type { MoneyProps } from '../domain/shared/money';
 import type { FailureCode } from '../domain/wagering/failure-code';
 import { WagerTransactionStatus, type WagerTransaction } from '../domain/wagering/wager-transaction';
 import type { Wallet } from '../domain/wallet/wallet';
+import type { LedgerDirection } from '../domain/wallet/wallet-ledger-entry';
+import type { WalletReconciliation } from '../domain/wallet/wallet-reconciliation';
 
 // Response contracts. Built from the domain objects explicitly, field by
 // field, so a new property in the domain never leaks into the API by accident.
@@ -25,6 +28,61 @@ export function walletView(wallet: Wallet): WalletView {
     version: wallet.version,
     createdAt: wallet.createdAt.toISOString(),
     updatedAt: wallet.updatedAt.toISOString(),
+  };
+}
+
+export interface LedgerEntryView {
+  id: string;
+  walletVersion: number;
+  transactionId: string;
+  direction: LedgerDirection;
+  money: MoneyProps;
+  balanceBefore: MoneyProps;
+  balanceAfter: MoneyProps;
+  createdAt: string;
+}
+
+export interface LedgerPageView {
+  walletId: string;
+  entries: LedgerEntryView[];
+  nextCursor: string | null;
+}
+
+export function ledgerPageView(page: LedgerPage): LedgerPageView {
+  return {
+    walletId: page.walletId,
+    entries: page.entries.map((entry) => ({
+      id: entry.id,
+      walletVersion: entry.walletVersion,
+      transactionId: entry.transactionId,
+      direction: entry.direction,
+      money: entry.money.toJSON(),
+      balanceBefore: entry.balanceBefore.toJSON(),
+      balanceAfter: entry.balanceAfter.toJSON(),
+      createdAt: entry.createdAt.toISOString(),
+    })),
+    nextCursor: page.nextCursor,
+  };
+}
+
+/** The contract of section 9: a divergence is signalled here, never corrected. */
+export interface ReconciliationView {
+  walletId: string;
+  storedBalance: MoneyProps;
+  calculatedBalance: MoneyProps;
+  difference: MoneyProps;
+  consistent: boolean;
+  checkedEntries: number;
+}
+
+export function reconciliationView(reconciliation: WalletReconciliation): ReconciliationView {
+  return {
+    walletId: reconciliation.walletId,
+    storedBalance: reconciliation.storedBalance.toJSON(),
+    calculatedBalance: reconciliation.calculatedBalance.toJSON(),
+    difference: reconciliation.difference.toJSON(),
+    consistent: reconciliation.isConsistent(),
+    checkedEntries: reconciliation.checkedEntries,
   };
 }
 

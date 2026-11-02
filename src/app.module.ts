@@ -4,12 +4,14 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { Module, type FactoryProvider, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { RelayOutbox } from './application/messaging/relay-outbox';
+import { NO_TELEMETRY, TELEMETRY, type Telemetry } from './application/telemetry';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/unit-of-work';
 import { ConsumeWagerMessage } from './application/wagering/consume-wager-message';
 import { ProcessWagerTransaction } from './application/wagering/process-wager-transaction';
 import { RetryPendingReferences } from './application/wagering/retry-pending-references';
 import { WagerTransactionQueries } from './application/wagering/wager-transaction-queries';
 import { OpenWallet } from './application/wallets/open-wallet';
+import { ReconcileWallet } from './application/wallets/reconcile-wallet';
 import { WalletQueries } from './application/wallets/wallet-queries';
 import { env } from './config/env';
 import { HealthController } from './health/health.controller';
@@ -27,8 +29,12 @@ import { PollingLoop } from './workers/polling-loop';
 
 // Use cases are plain classes with no Nest decorators: this module is the only
 // place that knows how they are put together.
-function useCase<T>(type: new (unitOfWork: UnitOfWork) => T): FactoryProvider<T> {
-  return { provide: type, useFactory: (unitOfWork: UnitOfWork) => new type(unitOfWork), inject: [UNIT_OF_WORK] };
+function useCase<T>(type: new (unitOfWork: UnitOfWork, telemetry: Telemetry) => T): FactoryProvider<T> {
+  return {
+    provide: type,
+    useFactory: (unitOfWork: UnitOfWork, telemetry: Telemetry) => new type(unitOfWork, telemetry),
+    inject: [UNIT_OF_WORK, TELEMETRY],
+  };
 }
 
 const WORKER_ERROR_DELAY_MS = 1_000;
@@ -83,6 +89,8 @@ function backgroundLoops(
   controllers: [HealthController, WalletsController, WageringController],
   providers: [
     { provide: APP_FILTER, useClass: ErrorResponseFilter },
+    // the port exists; its logging and metrics adapter comes next
+    { provide: TELEMETRY, useValue: NO_TELEMETRY },
     {
       provide: UNIT_OF_WORK,
       useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm, { lockTimeoutMs: env.lockTimeoutMs }),
@@ -90,6 +98,7 @@ function backgroundLoops(
     },
     useCase(OpenWallet),
     useCase(WalletQueries),
+    useCase(ReconcileWallet),
     useCase(ProcessWagerTransaction),
     useCase(WagerTransactionQueries),
 

@@ -2,6 +2,7 @@ import { LockMode, type EntityManager } from '@mikro-orm/postgresql';
 import type {
   InboxRepository,
   LedgerRepository,
+  LedgerTotals,
   OutboxRepository,
   Repositories,
   WagerTransactionRepository,
@@ -17,7 +18,7 @@ import {
   WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction';
 import { Wallet } from '../../domain/wallet/wallet';
-import type { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
+import { LedgerDirection, WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 import {
   InboxMessageRecordSchema,
   LedgerEntryRecordSchema,
@@ -244,6 +245,46 @@ class MikroOrmLedgerRepository implements LedgerRepository {
       balanceAfter: amountOf(entry.balanceAfter),
       createdAt: entry.createdAt,
     });
+  }
+
+  async listByWallet(walletId: string, afterVersion: number, limit: number): Promise<WalletLedgerEntry[]> {
+    // served by UNIQUE (wallet_id, wallet_version): an index range scan, however long the ledger
+    const records = await this.em.find(
+      LedgerEntryRecordSchema,
+      { wallet: walletId, walletVersion: { $gt: afterVersion } },
+      { orderBy: { walletVersion: 'asc' }, limit },
+    );
+    return records.map((record) =>
+      WalletLedgerEntry.rehydrate({
+        id: record.id,
+        walletId: record.wallet.id,
+        walletVersion: record.walletVersion,
+        transactionId: record.transaction.id,
+        direction: record.direction as LedgerDirection,
+        money: toMoney(record.amount, record.currency),
+        balanceBefore: toMoney(record.balanceBefore, record.currency),
+        balanceAfter: toMoney(record.balanceAfter, record.currency),
+        createdAt: record.createdAt,
+      }),
+    );
+  }
+
+  async totals(walletId: string, currency: string): Promise<LedgerTotals> {
+    // Credits and debits apart, so every value stays a non-negative amount;
+    // a ledger that does not add up still produces a meaningful difference.
+    const [row] = await this.em.execute<{ credits: string; debits: string; entries: number }[]>(
+      `select coalesce(sum(amount) filter (where direction = 'CREDIT'), 0) as credits,
+              coalesce(sum(amount) filter (where direction = 'DEBIT'), 0) as debits,
+              count(*)::int as entries
+         from wallet_ledger_entries
+        where wallet_id = ?`,
+      [walletId],
+    );
+    return {
+      credits: toMoney(String(row?.credits ?? '0'), currency),
+      debits: toMoney(String(row?.debits ?? '0'), currency),
+      entries: row?.entries ?? 0,
+    };
   }
 }
 
