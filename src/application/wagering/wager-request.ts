@@ -37,12 +37,13 @@ export function parseWagerRequest(body: unknown): WagerPayload {
   };
 }
 
-export function parseIdempotencyKey(value: unknown): string {
+/** `field` names where the key came from: the HTTP header or the message's data.idempotencyKey. */
+export function parseIdempotencyKey(value: unknown, field = 'Idempotency-Key'): string {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new InvalidRequestError('Idempotency-Key is required');
+    throw new InvalidRequestError(`${field} is required`);
   }
   if (value.length > MAX_TEXT_LENGTH) {
-    throw new InvalidRequestError(`Idempotency-Key must have at most ${MAX_TEXT_LENGTH} characters`);
+    throw new InvalidRequestError(`${field} must have at most ${MAX_TEXT_LENGTH} characters`);
   }
   return value;
 }

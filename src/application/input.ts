@@ -55,6 +55,15 @@ export function uuidText(input: Input, field: string): string {
   return value.toLowerCase();
 }
 
+export function dateText(input: Input, field: string): Date {
+  const value = requiredText(input, field);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new InvalidRequestError(`${field} must be an ISO-8601 date`);
+  }
+  return date;
+}
+
 export function moneyField(input: Input, field: string): Money {
   const value = input[field];
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {

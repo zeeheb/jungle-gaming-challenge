@@ -37,6 +37,11 @@ export class IdempotencyConflictError extends ApplicationError {
   readonly code = 'IDEMPOTENCY_CONFLICT';
 }
 
+/** A queue message id that was already consumed comes back with another payload: a broken producer. */
+export class MessageConflictError extends ApplicationError {
+  readonly code = 'MESSAGE_CONFLICT';
+}
+
 /**
  * Another submission with the same idempotency key or external id committed
  * first. The use case turns it into a replay or a conflict; it only escapes

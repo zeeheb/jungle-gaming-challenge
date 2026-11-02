@@ -1,11 +1,23 @@
 import type { EventContext } from '../../domain/events/wagering-events';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
 import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { newId } from '../../domain/shared/id';
 import { computePayloadHash, type WagerPayload } from '../../domain/wagering/payload-hash';
 import { settleWager } from '../../domain/wagering/settle-wager';
 import { WagerTransaction } from '../../domain/wagering/wager-transaction';
-import { DuplicateTransactionError, IdempotencyConflictError, WalletNotFoundError } from '../errors';
-import type { Repositories, UnitOfWork, WagerTransactionRepository } from '../unit-of-work';
+import {
+  DuplicateTransactionError,
+  IdempotencyConflictError,
+  MessageConflictError,
+  WalletNotFoundError,
+} from '../errors';
+import type { InboxRepository, Repositories, UnitOfWork, WagerTransactionRepository } from '../unit-of-work';
+
+/** Identifies the queue message that carried the request. */
+export interface InboxReceipt {
+  consumerName: string;
+  messageId: string;
+}
 
 export interface ProcessWagerCommand {
   idempotencyKey: string;
@@ -13,6 +25,8 @@ export interface ProcessWagerCommand {
   correlationId: string;
   /** Id of the message that carried the request, when there is one. */
   causationId?: string | undefined;
+  /** Present for queue messages: the inbox row is written in the same transaction as the effects. */
+  inbox?: InboxReceipt | undefined;
 }
 
 export interface ProcessWagerResult {
@@ -47,7 +61,7 @@ export class ProcessWagerTransaction {
     const context: EventContext = { correlationId: command.correlationId, causationId: command.causationId, occurredAt: at };
 
     try {
-      return await this.unitOfWork.run((repositories) => this.settle(repositories, incoming, context));
+      return await this.unitOfWork.run((repositories) => this.settle(repositories, incoming, context, command.inbox));
     } catch (error) {
       if (!(error instanceof DuplicateTransactionError)) {
         throw error;
@@ -66,12 +80,21 @@ export class ProcessWagerTransaction {
     }
   }
 
-  private async settle(repositories: Repositories, incoming: WagerTransaction, context: EventContext) {
+  private async settle(
+    repositories: Repositories,
+    incoming: WagerTransaction,
+    context: EventContext,
+    receipt: InboxReceipt | undefined,
+  ) {
     const { wallets, transactions, ledger, outbox } = repositories;
 
     const wallet = await wallets.findByIdForUpdate(incoming.walletId);
     if (!wallet) {
       throw new WalletNotFoundError(incoming.walletId);
+    }
+
+    if (receipt) {
+      await recordInInbox(repositories.inbox, receipt, incoming, context.occurredAt);
     }
 
     // Looked up only now, holding the lock: a duplicate that was in flight on
@@ -101,6 +124,30 @@ export class ProcessWagerTransaction {
     }
     return { transaction: incoming, replay: false };
   }
+}
+
+/**
+ * A message seen before was committed together with its effects, so the
+ * transaction lookup that follows turns it into a replay. Only a new message
+ * gets an inbox row. Two deliveries of one message name the same wallet, so
+ * the wallet lock already makes them take turns here.
+ */
+async function recordInInbox(
+  inbox: InboxRepository,
+  receipt: InboxReceipt,
+  incoming: WagerTransaction,
+  at: Date,
+): Promise<void> {
+  const seen = await inbox.find(receipt.consumerName, receipt.messageId);
+  if (seen) {
+    if (seen.payloadHash !== incoming.payloadHash) {
+      throw new MessageConflictError(`Message ${receipt.messageId} was already consumed with a different payload`);
+    }
+    return;
+  }
+  const message = InboxMessage.receive({ ...receipt, payloadHash: incoming.payloadHash, receivedAt: at });
+  message.markProcessed(at);
+  inbox.add(message);
 }
 
 async function findExisting(
