@@ -39,5 +39,55 @@ services:
       timeout: 3s
       retries: 30
 
+  # The service itself, only with `--profile app`. Day to day, `bun run dev`
+  # against the two containers above is quicker.
+  migrate:
+    profiles: [app]
+    build: .
+    image: wagering-processor:local
+    command: ["bun", "scripts/migrations.ts", "up"]
+    environment:
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # api + 2 workers = the "3 or more instances" of the challenge. They are the
+  # same process (HTTP, consumer, outbox relay, pending-reference worker);
+  # only the api publishes its port.
+  api:
+    profiles: [app]
+    image: wagering-processor:local
+    environment: &app-environment
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      SQS_ENDPOINT: http://ministack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    ports:
+      - "3000:3000"
+    depends_on: &app-dependencies
+      migrate:
+        condition: service_completed_successfully
+      ministack:
+        condition: service_healthy
+    healthcheck: &app-healthcheck
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # time for in-flight messages to finish after SIGTERM
+    stop_grace_period: 30s
+
+  worker:
+    profiles: [app]
+    image: wagering-processor:local
+    environment: *app-environment
+    depends_on: *app-dependencies
+    healthcheck: *app-healthcheck
+    stop_grace_period: 30s
+    deploy:
+      replicas: 2
+
 volumes:
   pgdata:
