@@ -50,8 +50,15 @@ export class Wallet {
    * same credit path as any other movement, booked against an internal OPENING
    * transaction, so the ledger explains the balance from the first cent.
    */
-  static open(props: { id: string; playerId: string; initialBalance: Money; at: Date }): OpenedWallet {
-    const { id, playerId, initialBalance, at } = props;
+  static open(props: {
+    id: string;
+    playerId: string;
+    initialBalance: Money;
+    at: Date;
+    /** Recorded on the OPENING transaction, if there is one. */
+    correlationId: string;
+  }): OpenedWallet {
+    const { id, playerId, initialBalance, at, correlationId } = props;
     if (initialBalance.isNegative()) {
       throw new InvalidWalletOperationError('Initial balance cannot be negative');
     }
@@ -63,7 +70,14 @@ export class Wallet {
 
     // version 0 never leaves this method: the opening credit takes it to 1
     const wallet = new Wallet(id, playerId, currency, Money.zero(currency), 0, at, at);
-    const transaction = WagerTransaction.opening({ id: newId(), walletId: id, playerId, money: initialBalance, at });
+    const transaction = WagerTransaction.opening({
+      id: newId(),
+      walletId: id,
+      playerId,
+      money: initialBalance,
+      at,
+      correlationId,
+    });
     const entry = wallet.credit(initialBalance, transaction.id, at);
     transaction.markProcessed(undefined, wallet.balance, at);
 

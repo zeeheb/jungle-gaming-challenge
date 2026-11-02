@@ -13,9 +13,10 @@ export const brl = (amount: string): Money => Money.from({ amount, currency: 'BR
 
 export const WALLET_ID = 'wallet-1';
 export const PLAYER_ID = 'player-1';
+export const CORRELATION_ID = 'corr-1';
 
 export function openWallet(initialBalance = '100.00', at = NOW): OpenedWallet {
-  return Wallet.open({ id: WALLET_ID, playerId: PLAYER_ID, initialBalance: brl(initialBalance), at });
+  return Wallet.open({ id: WALLET_ID, playerId: PLAYER_ID, initialBalance: brl(initialBalance), at, correlationId: CORRELATION_ID });
 }
 
 let sequence = 0;
@@ -36,6 +37,7 @@ export function wager(overrides: WagerOverrides = {}): WagerTransaction {
     kind: WagerTransactionKind.Bet,
     money: brl('10.00'),
     createdAt: NOW,
+    correlationId: CORRELATION_ID,
     ...overrides,
   };
   return WagerTransaction.create({

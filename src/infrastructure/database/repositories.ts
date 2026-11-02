@@ -148,6 +148,7 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
       nextReferenceAttemptAt: transaction.nextReferenceAttemptAt ?? null,
       createdAt: transaction.createdAt,
       processedAt: transaction.processedAt ?? null,
+      correlationId: transaction.correlationId ?? null,
     });
   }
 }
@@ -172,6 +173,7 @@ function toTransaction(record: WagerTransactionRecord | null): WagerTransaction 
     money: toMoney(record.amount, record.currency),
     referenceExternalTransactionId: record.referenceExternalTransactionId ?? undefined,
     createdAt: record.createdAt,
+    correlationId: record.correlationId ?? undefined,
     status: record.status as WagerTransactionStatus,
     referenceTransactionId: record.referenceTransactionId ?? undefined,
     failureCode: (record.failureCode ?? undefined) as FailureCode | undefined,

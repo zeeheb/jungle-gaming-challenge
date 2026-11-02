@@ -57,6 +57,7 @@ export class ProcessWagerTransaction {
       idempotencyKey: command.idempotencyKey,
       payloadHash: computePayloadHash(command.payload),
       createdAt: at,
+      correlationId: command.correlationId,
     });
     const context: EventContext = { correlationId: command.correlationId, causationId: command.causationId, occurredAt: at };
 

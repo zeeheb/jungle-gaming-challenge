@@ -41,6 +41,7 @@ describe('Wallet', () => {
         playerId: PLAYER_ID,
         initialBalance: Money.zero('USD'),
         at: NOW,
+        correlationId: 'corr-1',
       });
       expect(wallet.currency).toBe('USD');
     });
@@ -126,7 +127,7 @@ describe('Wallet', () => {
 
     it('cannot be opened with a negative balance', () => {
       expect(() =>
-        Wallet.open({ id: WALLET_ID, playerId: PLAYER_ID, initialBalance: brl('1.00').negate(), at: NOW }),
+        Wallet.open({ id: WALLET_ID, playerId: PLAYER_ID, initialBalance: brl('1.00').negate(), at: NOW, correlationId: 'corr-1' }),
       ).toThrow(InvalidWalletOperationError);
     });
   });

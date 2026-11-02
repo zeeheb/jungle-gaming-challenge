@@ -36,9 +36,11 @@ describe('migrations', () => {
   });
 
   it('are reversible all the way down and back up', async () => {
+    const migrations = (await orm.migrator.getExecuted()).length;
+
     await orm.migrator.down({ to: 0 });
     expect(await schemaObjects()).toEqual({ tables: [], functions: [] });
-    expect(await orm.migrator.getPending()).toHaveLength(2);
+    expect(await orm.migrator.getPending()).toHaveLength(migrations);
 
     await orm.migrator.up();
     expect((await schemaObjects()).tables).toHaveLength(5);

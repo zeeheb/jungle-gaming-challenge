@@ -123,6 +123,14 @@ describe('WagerTransaction', () => {
     it('cannot wait for a reference it does not have', () => {
       expect(() => wager({ kind: Kind.Bet }).markPendingReference(NOW)).toThrow(InvalidTransactionStateError);
     });
+
+    it('keeps the correlation id of the request that created it, outside the payload hash', () => {
+      const a = wager({ externalTransactionId: 'same', correlationId: 'request-a' });
+      const b = wager({ externalTransactionId: 'same', correlationId: 'request-b' });
+
+      expect(a.correlationId).toBe('request-a');
+      expect(a.payloadHash).toBe(b.payloadHash);
+    });
   });
 
   describe('balance effect', () => {

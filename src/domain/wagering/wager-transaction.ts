@@ -80,9 +80,17 @@ export interface CreateWagerTransactionProps {
   /** The provider's id of the referenced transaction, not our internal id. */
   referenceExternalTransactionId?: string | undefined;
   createdAt: Date;
+  /**
+   * Trace of the request that created the transaction, reused by events decided
+   * later (a pending reference resolved by the worker). Not a business field:
+   * it is not part of the payload hash.
+   */
+  correlationId: string;
 }
 
-export interface WagerTransactionState extends CreateWagerTransactionProps {
+export interface WagerTransactionState extends Omit<CreateWagerTransactionProps, 'correlationId'> {
+  /** Absent on transactions stored before it was recorded. */
+  correlationId?: string | undefined;
   status: WagerTransactionStatus;
   referenceTransactionId?: string | undefined;
   failureCode?: FailureCode | undefined;
@@ -122,6 +130,7 @@ export class WagerTransaction {
   readonly money: Money;
   readonly referenceExternalTransactionId: string | undefined;
   readonly createdAt: Date;
+  readonly correlationId: string | undefined;
 
   private _status: WagerTransactionStatus;
   private _referenceTransactionId: string | undefined;
@@ -145,6 +154,7 @@ export class WagerTransaction {
     this.money = state.money;
     this.referenceExternalTransactionId = state.referenceExternalTransactionId;
     this.createdAt = state.createdAt;
+    this.correlationId = state.correlationId;
     this._status = state.status;
     this._referenceTransactionId = state.referenceTransactionId;
     this._failureCode = state.failureCode;
@@ -190,7 +200,14 @@ export class WagerTransaction {
   }
 
   /** The internal transaction behind a wallet's initial balance. */
-  static opening(props: { id: string; walletId: string; playerId: string; money: Money; at: Date }): WagerTransaction {
+  static opening(props: {
+    id: string;
+    walletId: string;
+    playerId: string;
+    money: Money;
+    at: Date;
+    correlationId: string;
+  }): WagerTransaction {
     const payload = {
       providerId: INTERNAL_PROVIDER_ID,
       externalTransactionId: `opening:${props.walletId}`,
@@ -207,6 +224,7 @@ export class WagerTransaction {
       idempotencyKey: `${payload.providerId}:${payload.externalTransactionId}`,
       payloadHash: computePayloadHash(payload),
       createdAt: props.at,
+      correlationId: props.correlationId,
       status: WagerTransactionStatus.Pending,
       referenceAttempts: 0,
     });

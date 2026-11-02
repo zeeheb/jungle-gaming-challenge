@@ -34,6 +34,7 @@ export class OpenWallet {
       playerId: command.playerId,
       initialBalance: command.initialBalance,
       at,
+      correlationId: command.correlationId,
     });
 
     await this.unitOfWork.run(async ({ wallets, transactions, ledger, outbox }) => {

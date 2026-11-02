@@ -54,6 +54,7 @@ export const WagerTransactionRecordSchema = defineEntity({
     nextReferenceAttemptAt: p.datetime().nullable(),
     createdAt: p.datetime(),
     processedAt: p.datetime().nullable(),
+    correlationId: p.text().nullable(),
   },
 });
 export type WagerTransactionRecord = InferEntity<typeof WagerTransactionRecordSchema>;
