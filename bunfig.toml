@@ -1,0 +1,3 @@
+[test]
+# Runs before any test file is imported, so src/config/env.ts already reads the test database URL.
+preload = ["./test/support/test-env.ts"]

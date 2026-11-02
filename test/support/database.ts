@@ -1,16 +1,20 @@
 import { MikroORM } from '@mikro-orm/postgresql';
 import config from '../../src/infrastructure/database/mikro-orm.config';
 
-export const TEST_DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? 'postgres://wagering:wagering@localhost:5432/wagering_test';
-
 export type Row = Record<string, unknown>;
 export type Sql = (query: string, params?: unknown[]) => Promise<Row[]>;
 
+/**
+ * DATABASE_URL already points at the test database (test/support/test-env.ts).
+ * Tests drop the whole schema, so anything else is refused outright.
+ */
 export async function connectTestDatabase(): Promise<MikroORM> {
+  const databaseName = new URL(config.clientUrl ?? '').pathname.slice(1);
+  if (!databaseName.endsWith('_test')) {
+    throw new Error(`Refusing to run tests against database "${databaseName}"`);
+  }
   return MikroORM.init({
     ...config,
-    clientUrl: TEST_DATABASE_URL,
     ensureDatabase: true,
     migrations: { ...config.migrations, silent: true },
   });
@@ -47,7 +51,45 @@ export async function waitUntil(condition: () => Promise<boolean>, timeoutMs = 5
   }
 }
 
+/** Number of sessions of this database currently blocked on a lock (row, tuple or unique index entry). */
+export async function lockWaiters(sql: Sql): Promise<number> {
+  const [row] = await sql(
+    `select count(*)::int as waiting from pg_stat_activity
+      where datname = current_database() and wait_event_type = 'Lock'`,
+  );
+  return row!['waiting'] as number;
+}
+
+/** Makes an interleaving deterministic: returns once some other session is blocked on a lock. */
+export function waitForLockWaiter(sql: Sql): Promise<void> {
+  return waitUntil(async () => (await lockWaiters(sql)) > 0);
+}
+
 /** Runs `work` in one database transaction; deferred constraints are checked when it commits. */
 export async function inTransaction<T>(orm: MikroORM, work: (sql: Sql) => Promise<T>): Promise<T> {
   return orm.em.fork().transactional((em) => work((query, params = []) => em.execute(query, params)));
+}
+
+/**
+ * Plays "another instance" holding a wallet: takes the same row lock the use
+ * case takes and keeps it until `release` is called.
+ */
+export async function holdWalletLock(orm: MikroORM, walletId: string): Promise<{ release(): Promise<void> }> {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let locked!: () => void;
+  const isLocked = new Promise<void>((resolve) => (locked = resolve));
+
+  const holder = inTransaction(orm, async (sql) => {
+    await sql('select id from wallets where id = ? for update', [walletId]);
+    locked();
+    await released;
+  });
+  await Promise.race([isLocked, holder]);
+  return {
+    release: async () => {
+      release();
+      await holder;
+    },
+  };
 }

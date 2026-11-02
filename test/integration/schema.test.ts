@@ -6,7 +6,7 @@ import {
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { newId } from '../../src/domain/shared/id';
-import { inTransaction, setupTestDatabase, sqlFor, waitUntil, type Sql } from '../support/database';
+import { inTransaction, setupTestDatabase, sqlFor, waitForLockWaiter, type Sql } from '../support/database';
 import {
   insertEntry,
   insertTransaction,
@@ -257,7 +257,7 @@ describe('wallet_ledger_entries', () => {
     expect(await walletState(wallet)).toMatchObject({ entries: 1, version: 1 });
   });
 
-  it('stop a lost update even when the application forgets to lock the wallet', async () => {
+  it('stops a lost update even when the application forgets to lock the wallet', async () => {
     const wallet = await openWallet(orm, '100.00');
 
     // Both writers believe the wallet is at version 1 with 100.00 (nobody used
@@ -274,13 +274,6 @@ describe('wallet_ledger_entries', () => {
           after: '90.00',
         }),
       );
-    const someoneIsWaitingOnALock = async () => {
-      const [row] = await sql(
-        `select count(*) as waiting from pg_stat_activity
-          where datname = current_database() and wait_event_type = 'Lock'`,
-      );
-      return Number(row!.waiting) > 0;
-    };
 
     let firstWrote!: () => void;
     const firstHasWritten = new Promise<void>((resolve) => (firstWrote = resolve));
@@ -288,7 +281,7 @@ describe('wallet_ledger_entries', () => {
     const first = inTransaction(orm, async (tx) => {
       await debitFromVersion1(tx);
       firstWrote();
-      await waitUntil(someoneIsWaitingOnALock);
+      await waitForLockWaiter(sql);
       await tx(`update wallets set balance = 90, version = 2 where id = ?`, [wallet.id]);
     });
     await firstHasWritten;
