@@ -512,3 +512,18 @@ Os casos de uso dizem **o que aconteceu**, em termos de negócio, por uma porta 
 - **O histograma de latência mede o caso de uso**, e não a fila: uma mensagem que esperou minutos na fila aparece rápida. A idade da mensagem (agora − `occurredAt`) seria a próxima métrica a acrescentar.
 - **Coletar os gauges consulta o banco e o SQS.** O custo é uma consulta por índice e uma chamada de API por coleta (a cada 15–30 s, tipicamente).
 
+
+## Testes de caos: processos reais
+
+`bun run test:chaos` sobe cópias reais do serviço (`bun src/main.ts`, via `Bun.spawn`), cada uma com a própria porta, o próprio pool de conexões e os próprios consumidor, relay e worker, todas no mesmo banco e nas mesmas filas: o que seriam vários pods. As quedas também são reais (`SIGKILL`): nenhum hook de desligamento roda, a transação aberta é desfeita pelo PostgreSQL e a mensagem em andamento não recebe ack. As filas do teste usam timeout de visibilidade de 2 s, para que a mensagem de um processo morto volte logo.
+
+| Cenário (seção 13) | O que o teste faz | O que ele confere |
+|---|---|---|
+| ≥ 3 instâncias simultâneas, wallets em paralelo | 3 processos; 6 wallets recebendo pela fila um `REFUND` antes da `BET` e 15 apostas, cada mensagem entregue **duas vezes**; ao mesmo tempo, duas apostas de 80,00 numa wallet de 100,00 enviadas a processos **diferentes**, e a mesma aposta 30 vezes espalhada pelos três | saldos exatos, cada transação uma vez, duplicatas reconhecidas pela inbox, uma das apostas de 80 rejeitada, um único débito na aposta repetida, saldo = soma do ledger em todas as wallets, e a fila de fato dividida entre os processos |
+| Dois (aqui três) publishers na mesma outbox | os três relays rodando juntos | a soma de `wagering_outbox_published_total` das instâncias é igual ao número de eventos (cada um entregue ao broker uma vez) e a fila de eventos tem cada `eventId` uma vez |
+| Worker morto depois do commit e antes do ack | instância com `FAULT_CRASH_AFTER_COMMIT=true` sai com código 86 logo após confirmar a primeira transação nova | transação, ledger e inbox gravados, mensagem ainda em voo; uma segunda instância recebe a reentrega e só faz ack (`wagering_duplicates_total{type="message"} = 1`), e o débito continua único |
+| Reinício do serviço com prova de consistência | 3 instâncias consumindo 160 mensagens; uma morre no meio e é substituída; depois **todas** caem e uma nova sobe | nenhuma mensagem perdida ou aplicada duas vezes (160 linhas na inbox, 41 transações por wallet), e `POST /reconciliation` de cada wallet na instância nova responde `consistent: true` |
+
+- **Injeção de falha:** `FAULT_CRASH_AFTER_COMMIT` liga um gancho (`beforeAck`) do consumidor que encerra o processo entre o commit e o `DeleteMessage`, só para transações novas (uma reentrega é replay e passa). Ele fica desligado por padrão e existe apenas para estes testes.
+- **Estabilidade:** os três cenários rodaram 5 vezes seguidas sem falha, em cerca de 10 s cada execução. A espera é sempre por estado ("fila vazia, nada pendente, outbox publicada"), nunca por tempo fixo.
+- **Limitação:** no Windows, `SIGTERM` também mata o processo na hora, então o desligamento **gracioso** entre processos não é exercitado aqui. Ele é testado dentro do processo (`wager-consumer.test.ts`, chamando o mesmo `stop()` que o SIGTERM aciona).
