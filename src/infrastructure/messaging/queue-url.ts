@@ -1,4 +1,4 @@
-import { GetQueueUrlCommand, type SQSClient } from '@aws-sdk/client-sqs';
+import { GetQueueAttributesCommand, GetQueueUrlCommand, type SQSClient } from '@aws-sdk/client-sqs';
 
 /** Looks the URL of a queue up once and caches it. A failed lookup is tried again on the next call. */
 export class QueueUrl {
@@ -24,4 +24,12 @@ export class QueueUrl {
     );
     return this.url;
   }
+}
+
+/** Messages waiting to be received (approximate, as SQS reports it). */
+export async function approximateDepth(sqs: SQSClient, queue: QueueUrl): Promise<number> {
+  const { Attributes } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: await queue.get(), AttributeNames: ['ApproximateNumberOfMessages'] }),
+  );
+  return Number(Attributes?.['ApproximateNumberOfMessages'] ?? Number.NaN);
 }

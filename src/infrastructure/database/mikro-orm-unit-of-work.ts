@@ -10,12 +10,20 @@ import {
   WalletAlreadyExistsError,
 } from '../../application/errors';
 import type { Repositories, UnitOfWork } from '../../application/unit-of-work';
+import type { WageringMetrics } from '../observability/wagering-metrics';
 import { createRepositories } from './repositories';
 
 export interface UnitOfWorkOptions {
   /** Longest wait for a row lock before the unit of work fails with TransientFailureError. */
   lockTimeoutMs: number;
+  metrics?: WageringMetrics | undefined;
 }
+
+const LOCK_CONFLICT_REASONS: Readonly<Record<string, string>> = {
+  '55P03': 'lock_timeout',
+  '40P01': 'deadlock',
+  '40001': 'serialization',
+};
 
 const DUPLICATE_TRANSACTION_CONSTRAINTS = new Set([
   'wager_transactions_provider_idempotency_key',
@@ -58,6 +66,10 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         return work(createRepositories(em));
       });
     } catch (error) {
+      const reason = LOCK_CONFLICT_REASONS[String((error as { code?: unknown } | null)?.code)];
+      if (reason) {
+        this.options.metrics?.lockConflicts.inc({ reason });
+      }
       throw translate(error);
     }
   }

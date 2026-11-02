@@ -9,6 +9,8 @@ import {
 import { Logger } from '@nestjs/common';
 import type { ConsumeWagerMessage, MessageOutcome } from '../../application/wagering/consume-wager-message';
 import { exponentialBackoff } from '../../domain/shared/backoff';
+import { logContext } from '../observability/log-context';
+import type { WageringMetrics } from '../observability/wagering-metrics';
 import { QueueUrl } from './queue-url';
 
 export interface WagerConsumerOptions {
@@ -41,6 +43,7 @@ export class SqsWagerConsumer {
     private readonly sqs: SQSClient,
     private readonly consume: ConsumeWagerMessage,
     private readonly options: WagerConsumerOptions,
+    private readonly metrics?: WageringMetrics,
   ) {
     this.queue = new QueueUrl(sqs, options.queueName);
     this.deadLetterQueue = new QueueUrl(sqs, options.deadLetterQueueName);
@@ -75,7 +78,9 @@ export class SqsWagerConsumer {
         await this.release(queueUrl, group.slice(index));
         return;
       }
-      if (!(await this.handle(queueUrl, message))) {
+      // every log line about this message carries the broker's id for it
+      const settled = await logContext.run({ sqsMessageId: message.MessageId }, () => this.handle(queueUrl, message));
+      if (!settled) {
         // the failed message comes back later, and the rest of its group must not overtake it
         await this.release(queueUrl, group.slice(index + 1));
         return;
@@ -87,7 +92,7 @@ export class SqsWagerConsumer {
   private async handle(queueUrl: string, message: Message): Promise<boolean> {
     const attempt = Number(message.Attributes?.['ApproximateReceiveCount'] ?? '1');
     const outcome = await this.consume.execute(message.Body ?? '').catch((error: unknown): MessageOutcome => {
-      this.logger.error(`Unexpected error on message ${message.MessageId}: ${describe(error)}`);
+      this.logger.error({ msg: 'unexpected error while handling a message', error: describe(error), attempt });
       return { action: 'retry', code: 'UNEXPECTED_ERROR', reason: describe(error) };
     });
 
@@ -102,21 +107,27 @@ export class SqsWagerConsumer {
       }
       // Retry with backoff: the message stays invisible for a while, then SQS delivers it again.
       const delayMs = exponentialBackoff(attempt, this.options.retryBaseDelayMs, this.options.retryMaxDelayMs);
-      this.logger.warn(
-        `Message ${message.MessageId} failed with ${outcome.code} (attempt ${attempt}/${this.options.maxAttempts}), retrying in ${delayMs}ms`,
-      );
+      this.metrics?.messageRetries.inc({ code: outcome.code });
+      this.logger.warn({
+        msg: 'message will be retried',
+        code: outcome.code,
+        attempt,
+        maxAttempts: this.options.maxAttempts,
+        retryInMs: delayMs,
+      });
       await this.setVisibility(queueUrl, message, Math.ceil(delayMs / 1_000));
       return false;
     } catch (error) {
       // Could not ack or move it: it reappears after its visibility timeout,
       // and whatever was committed turns that redelivery into a duplicate.
-      this.logger.error(`Could not settle message ${message.MessageId} in SQS: ${describe(error)}`);
+      this.logger.error({ msg: 'could not ack or move the message in SQS', error: describe(error) });
       return false;
     }
   }
 
   private async deadLetter(queueUrl: string, message: Message, code: string, reason: string, attempt: number) {
-    this.logger.warn(`Message ${message.MessageId} sent to the DLQ after ${attempt} attempt(s): ${code} ${reason}`);
+    this.metrics?.messagesDeadLettered.inc({ code });
+    this.logger.warn({ msg: 'message sent to the DLQ', code, reason, attempt });
     await this.sqs.send(
       new SendMessageCommand({
         QueueUrl: await this.deadLetterQueue.get(),
@@ -148,7 +159,7 @@ export class SqsWagerConsumer {
     await Promise.all(
       messages.map((message) =>
         this.setVisibility(queueUrl, message, 0).catch((error: unknown) =>
-          this.logger.warn(`Could not release message ${message.MessageId}: ${describe(error)}`),
+          this.logger.warn({ msg: 'could not release message', sqsMessageId: message.MessageId, error: describe(error) }),
         ),
       ),
     );

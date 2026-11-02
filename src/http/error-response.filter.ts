@@ -77,7 +77,7 @@ export class ErrorResponseFilter implements ExceptionFilter {
       return { status, body: errorBody(code, error.message) };
     }
 
-    this.logger.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    this.logger.error(error instanceof Error ? error : { msg: 'unexpected error', error: String(error) });
     // never echo internals (SQL, stack traces) to the caller
     return { status: HttpStatus.INTERNAL_SERVER_ERROR, body: errorBody('INTERNAL_ERROR', 'Unexpected error') };
   }

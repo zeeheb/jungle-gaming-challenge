@@ -47,7 +47,7 @@ export class PollingLoop {
         if (signal.aborted) {
           break; // the round was cancelled by stop()
         }
-        this.logger.error(error instanceof Error ? error.message : String(error));
+        this.logger.error({ msg: 'round failed, pausing before the next one', error: error instanceof Error ? error.message : String(error) });
         await this.pause(this.options.errorDelayMs);
       }
     }

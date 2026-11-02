@@ -2,6 +2,7 @@ import { SendMessageBatchCommand, type SendMessageBatchRequestEntry, type SQSCli
 import { Logger } from '@nestjs/common';
 import type { EventPublisher } from '../../application/messaging/relay-outbox';
 import type { OutboxMessage } from '../../domain/messaging/outbox-message';
+import type { WageringMetrics } from '../observability/wagering-metrics';
 import { QueueUrl } from './queue-url';
 
 /** SendMessageBatch accepts at most 10 entries. */
@@ -20,6 +21,7 @@ export class SqsEventPublisher implements EventPublisher {
   constructor(
     private readonly sqs: SQSClient,
     queueName: string,
+    private readonly metrics?: WageringMetrics,
     // the outbox rows stay locked while we wait: never wait for long
     private readonly timeoutMs = 5_000,
   ) {
@@ -41,13 +43,19 @@ export class SqsEventPublisher implements EventPublisher {
           }
         }
         for (const failure of response.Failed ?? []) {
-          this.logger.warn(`Event ${failure.Id} not accepted by ${this.queue.queueName}: ${failure.Code} ${failure.Message ?? ''}`);
+          this.logger.warn({ msg: 'event not accepted by the broker', eventId: failure.Id, code: failure.Code });
         }
       }
     } catch (error) {
       // whatever was accepted before the failure still counts; the rest is retried
-      this.logger.warn(`Publishing to ${this.queue.queueName} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.warn({
+        msg: 'publishing failed, events will be retried',
+        queue: this.queue.queueName,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+    this.metrics?.eventsPublished.inc(accepted.size);
+    this.metrics?.eventPublishFailures.inc(messages.length - accepted.size);
     return accepted;
   }
 }

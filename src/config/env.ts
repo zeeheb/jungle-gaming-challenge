@@ -26,6 +26,7 @@ function readBool(name: string, fallback: boolean): boolean {
 // Defaults match docker-compose.yml so `bun run dev` works without a .env file.
 export const env = {
   port: readInt('PORT', 3000),
+  logLevel: read('LOG_LEVEL', 'info'),
   databaseUrl: read('DATABASE_URL', 'postgres://wagering:wagering@localhost:5432/wagering'),
   // How long a request waits for a busy wallet before giving up with a retryable error.
   lockTimeoutMs: readInt('DB_LOCK_TIMEOUT_MS', 5_000),

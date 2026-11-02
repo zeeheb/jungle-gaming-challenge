@@ -1,5 +1,6 @@
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
 import { TransientFailureError } from '../errors';
+import { NO_TELEMETRY, type Telemetry } from '../telemetry';
 import type { UnitOfWork } from '../unit-of-work';
 import { settleAndRecord } from './settlement';
 
@@ -33,6 +34,7 @@ export class RetryPendingReferences {
   constructor(
     private readonly unitOfWork: UnitOfWork,
     private readonly batchSize: number,
+    private readonly telemetry: Telemetry = NO_TELEMETRY,
   ) {}
 
   /** `now` decides what is due; tests pass the scheduled time instead of sleeping until it. */
@@ -52,12 +54,12 @@ export class RetryPendingReferences {
 
   private async retry(candidate: WagerTransaction, now: Date): Promise<Outcome> {
     try {
-      return await this.unitOfWork.run(async (repositories) => {
+      const retried = await this.unitOfWork.run(async (repositories) => {
         const wallet = await repositories.wallets.findByIdForUpdate(candidate.walletId);
         // the candidate was read without any lock: only this copy counts
         const transaction = await repositories.transactions.findById(candidate.id);
         if (!wallet || !transaction?.isDueForReferenceRetry(now)) {
-          return 'skipped';
+          return undefined;
         }
 
         await settleAndRecord(
@@ -71,8 +73,14 @@ export class RetryPendingReferences {
           },
           { isNew: false },
         );
-        return transaction.isTerminal() ? 'settled' : 'waiting';
+        return transaction;
       });
+
+      if (!retried) {
+        return 'skipped';
+      }
+      this.telemetry.referenceRetried({ transaction: retried }); // after the commit
+      return retried.isTerminal() ? 'settled' : 'waiting';
     } catch (error) {
       if (error instanceof TransientFailureError) {
         return 'busy';

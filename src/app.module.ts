@@ -4,7 +4,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { Module, type FactoryProvider, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { RelayOutbox } from './application/messaging/relay-outbox';
-import { NO_TELEMETRY, TELEMETRY, type Telemetry } from './application/telemetry';
+import { TELEMETRY, type Telemetry } from './application/telemetry';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/unit-of-work';
 import { ConsumeWagerMessage } from './application/wagering/consume-wager-message';
 import { ProcessWagerTransaction } from './application/wagering/process-wager-transaction';
@@ -17,13 +17,18 @@ import { env } from './config/env';
 import { HealthController } from './health/health.controller';
 import { correlationIdMiddleware } from './http/correlation-id';
 import { ErrorResponseFilter } from './http/error-response.filter';
+import { MetricsController } from './http/metrics.controller';
 import { WageringController } from './http/wagering.controller';
 import { WalletsController } from './http/wallets.controller';
 import mikroOrmConfig from './infrastructure/database/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/database/mikro-orm-unit-of-work';
+import { outboxBacklog } from './infrastructure/database/outbox-backlog';
 import { SqsEventPublisher } from './infrastructure/messaging/sqs-event-publisher';
 import { SqsWagerConsumer } from './infrastructure/messaging/sqs-wager-consumer';
+import { approximateDepth, QueueUrl } from './infrastructure/messaging/queue-url';
 import { SqsModule } from './infrastructure/messaging/sqs.module';
+import { ObservedTelemetry } from './infrastructure/observability/observed-telemetry';
+import { WageringMetrics } from './infrastructure/observability/wagering-metrics';
 import { BackgroundWorkers } from './workers/background-workers';
 import { PollingLoop } from './workers/polling-loop';
 
@@ -86,15 +91,33 @@ function backgroundLoops(
     MikroOrmModule.forRoot({ ...mikroOrmConfig, registerRequestContext: false }),
     SqsModule,
   ],
-  controllers: [HealthController, WalletsController, WageringController],
+  controllers: [HealthController, MetricsController, WalletsController, WageringController],
   providers: [
     { provide: APP_FILTER, useClass: ErrorResponseFilter },
-    // the port exists; its logging and metrics adapter comes next
-    { provide: TELEMETRY, useValue: NO_TELEMETRY },
+
+    // observability
+    {
+      provide: WageringMetrics,
+      useFactory: (orm: MikroORM, sqs: SQSClient) => {
+        const deadLetterQueue = new QueueUrl(sqs, env.sqs.transactionsDlq);
+        return new WageringMetrics({
+          outboxBacklog: () => outboxBacklog(orm),
+          deadLetterQueueDepth: () => approximateDepth(sqs, deadLetterQueue),
+        });
+      },
+      inject: [MikroORM, SQSClient],
+    },
+    {
+      provide: TELEMETRY,
+      useFactory: (metrics: WageringMetrics) => new ObservedTelemetry(metrics),
+      inject: [WageringMetrics],
+    },
+
     {
       provide: UNIT_OF_WORK,
-      useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm, { lockTimeoutMs: env.lockTimeoutMs }),
-      inject: [MikroORM],
+      useFactory: (orm: MikroORM, metrics: WageringMetrics) =>
+        new MikroOrmUnitOfWork(orm, { lockTimeoutMs: env.lockTimeoutMs, metrics }),
+      inject: [MikroORM, WageringMetrics],
     },
     useCase(OpenWallet),
     useCase(WalletQueries),
@@ -110,24 +133,26 @@ function backgroundLoops(
     },
     {
       provide: SqsWagerConsumer,
-      useFactory: (sqs: SQSClient, consume: ConsumeWagerMessage) =>
-        new SqsWagerConsumer(sqs, consume, {
-          ...env.consumer,
-          queueName: env.sqs.transactionsQueue,
-          deadLetterQueueName: env.sqs.transactionsDlq,
-        }),
-      inject: [SQSClient, ConsumeWagerMessage],
+      useFactory: (sqs: SQSClient, consume: ConsumeWagerMessage, metrics: WageringMetrics) =>
+        new SqsWagerConsumer(
+          sqs,
+          consume,
+          { ...env.consumer, queueName: env.sqs.transactionsQueue, deadLetterQueueName: env.sqs.transactionsDlq },
+          metrics,
+        ),
+      inject: [SQSClient, ConsumeWagerMessage, WageringMetrics],
     },
     {
       provide: RelayOutbox,
-      useFactory: (unitOfWork: UnitOfWork, sqs: SQSClient) =>
-        new RelayOutbox(unitOfWork, new SqsEventPublisher(sqs, env.sqs.eventsQueue), env.outbox.batchSize),
-      inject: [UNIT_OF_WORK, SQSClient],
+      useFactory: (unitOfWork: UnitOfWork, sqs: SQSClient, metrics: WageringMetrics) =>
+        new RelayOutbox(unitOfWork, new SqsEventPublisher(sqs, env.sqs.eventsQueue, metrics), env.outbox.batchSize),
+      inject: [UNIT_OF_WORK, SQSClient, WageringMetrics],
     },
     {
       provide: RetryPendingReferences,
-      useFactory: (unitOfWork: UnitOfWork) => new RetryPendingReferences(unitOfWork, env.pendingReferences.batchSize),
-      inject: [UNIT_OF_WORK],
+      useFactory: (unitOfWork: UnitOfWork, telemetry: Telemetry) =>
+        new RetryPendingReferences(unitOfWork, env.pendingReferences.batchSize, telemetry),
+      inject: [UNIT_OF_WORK, TELEMETRY],
     },
     {
       provide: BackgroundWorkers,

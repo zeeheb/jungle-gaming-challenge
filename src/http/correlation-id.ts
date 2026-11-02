@@ -1,6 +1,7 @@
 import { createParamDecorator, type ExecutionContext } from '@nestjs/common';
 import type { NextFunction, Request, Response } from 'express';
 import { newId } from '../domain/shared/id';
+import { logContext } from '../infrastructure/observability/log-context';
 
 const HEADER = 'X-Correlation-Id';
 const MAX_LENGTH = 128;
@@ -14,7 +15,8 @@ export function correlationIdMiddleware(request: Request, response: Response, ne
   const correlationId = received && received.length <= MAX_LENGTH ? received : newId();
   response.locals['correlationId'] = correlationId;
   response.setHeader(HEADER, correlationId);
-  next();
+  // every log line written while handling this request carries it
+  logContext.run({ correlationId }, next);
 }
 
 export const CorrelationId = createParamDecorator((_: unknown, context: ExecutionContext): string => {
