@@ -76,6 +76,19 @@ export const LedgerEntryRecordSchema = defineEntity({
 });
 export type LedgerEntryRecord = InferEntity<typeof LedgerEntryRecordSchema>;
 
+export const InboxMessageRecordSchema = defineEntity({
+  name: 'InboxMessageRecord',
+  tableName: 'inbox_messages',
+  properties: {
+    consumerName: p.text().primary(),
+    messageId: p.text().primary(),
+    payloadHash: p.text(),
+    receivedAt: p.datetime(),
+    processedAt: p.datetime().nullable(),
+  },
+});
+export type InboxMessageRecord = InferEntity<typeof InboxMessageRecordSchema>;
+
 export const OutboxMessageRecordSchema = defineEntity({
   name: 'OutboxMessageRecord',
   tableName: 'outbox_messages',
@@ -96,5 +109,6 @@ export const entities = [
   WalletRecordSchema,
   WagerTransactionRecordSchema,
   LedgerEntryRecordSchema,
+  InboxMessageRecordSchema,
   OutboxMessageRecordSchema,
 ];

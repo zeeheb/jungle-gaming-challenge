@@ -1,12 +1,14 @@
 import { LockMode, type EntityManager } from '@mikro-orm/postgresql';
 import type {
+  InboxRepository,
   LedgerRepository,
   OutboxRepository,
   Repositories,
   WagerTransactionRepository,
   WalletRepository,
 } from '../../application/unit-of-work';
-import type { OutboxMessage } from '../../domain/messaging/outbox-message';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
+import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { Money } from '../../domain/shared/money';
 import type { FailureCode } from '../../domain/wagering/failure-code';
 import {
@@ -17,10 +19,12 @@ import {
 import { Wallet } from '../../domain/wallet/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 import {
+  InboxMessageRecordSchema,
   LedgerEntryRecordSchema,
   OutboxMessageRecordSchema,
   WagerTransactionRecordSchema,
   WalletRecordSchema,
+  type OutboxMessageRecord,
   type WagerTransactionRecord,
   type WalletRecord,
 } from './entities';
@@ -31,6 +35,7 @@ export function createRepositories(em: EntityManager): Repositories {
     wallets: new MikroOrmWalletRepository(em),
     transactions: new MikroOrmWagerTransactionRepository(em),
     ledger: new MikroOrmLedgerRepository(em),
+    inbox: new MikroOrmInboxRepository(em),
     outbox: new MikroOrmOutboxRepository(em),
   };
 }
@@ -199,7 +204,38 @@ class MikroOrmLedgerRepository implements LedgerRepository {
   }
 }
 
+class MikroOrmInboxRepository implements InboxRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async find(consumerName: string, messageId: string): Promise<InboxMessage | undefined> {
+    const record = await this.em.findOne(InboxMessageRecordSchema, { consumerName, messageId });
+    if (!record) {
+      return undefined;
+    }
+    return InboxMessage.rehydrate({
+      consumerName: record.consumerName,
+      messageId: record.messageId,
+      payloadHash: record.payloadHash,
+      receivedAt: record.receivedAt,
+      processedAt: record.processedAt ?? undefined,
+    });
+  }
+
+  add(message: InboxMessage): void {
+    this.em.create(InboxMessageRecordSchema, {
+      consumerName: message.consumerName,
+      messageId: message.messageId,
+      payloadHash: message.payloadHash,
+      receivedAt: message.receivedAt,
+      processedAt: message.processedAt ?? null,
+    });
+  }
+}
+
 class MikroOrmOutboxRepository implements OutboxRepository {
+  // same bookkeeping as the wallets: claimed messages are updated through their records
+  private readonly records = new WeakMap<OutboxMessage, OutboxMessageRecord>();
+
   constructor(private readonly em: EntityManager) {}
 
   add(message: OutboxMessage): void {
@@ -209,9 +245,47 @@ class MikroOrmOutboxRepository implements OutboxRepository {
       eventType: message.eventType,
       payload: { ...message.payload },
       occurredAt: message.occurredAt,
-      attempts: message.attempts,
-      nextAttemptAt: message.nextAttemptAt ?? null,
-      publishedAt: message.publishedAt ?? null,
+      ...mutableOutboxFields(message),
     });
   }
+
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    // FOR UPDATE SKIP LOCKED: concurrent relays split the pending rows between
+    // them instead of queueing on the same ones
+    const records = await this.em.find(
+      OutboxMessageRecordSchema,
+      { publishedAt: null, nextAttemptAt: { $lte: now } },
+      { orderBy: { occurredAt: 'asc', id: 'asc' }, limit, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+    );
+    return records.map((record) => {
+      const message = OutboxMessage.rehydrate({
+        id: record.id,
+        aggregateId: record.aggregateId,
+        eventType: record.eventType,
+        payload: record.payload,
+        occurredAt: record.occurredAt,
+        attempts: record.attempts,
+        nextAttemptAt: record.nextAttemptAt ?? undefined,
+        publishedAt: record.publishedAt ?? undefined,
+      });
+      this.records.set(message, record);
+      return message;
+    });
+  }
+
+  update(message: OutboxMessage): void {
+    const record = this.records.get(message);
+    if (!record) {
+      throw new Error(`Outbox message ${message.id} was not claimed by this unit of work`);
+    }
+    Object.assign(record, mutableOutboxFields(message));
+  }
+}
+
+function mutableOutboxFields(message: OutboxMessage) {
+  return {
+    attempts: message.attempts,
+    nextAttemptAt: message.nextAttemptAt ?? null,
+    publishedAt: message.publishedAt ?? null,
+  };
 }

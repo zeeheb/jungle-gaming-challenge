@@ -1,3 +1,4 @@
+import type { InboxMessage } from '../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../domain/messaging/outbox-message';
 import type { WagerTransaction } from '../domain/wagering/wager-transaction';
 import type { Wallet } from '../domain/wallet/wallet';
@@ -31,14 +32,27 @@ export interface LedgerRepository {
   add(entry: WalletLedgerEntry): void;
 }
 
+export interface InboxRepository {
+  find(consumerName: string, messageId: string): Promise<InboxMessage | undefined>;
+  add(message: InboxMessage): void;
+}
+
 export interface OutboxRepository {
   add(message: OutboxMessage): void;
+  /**
+   * Pending messages whose next attempt is due, oldest first, locked until the
+   * unit of work ends. Rows another unit of work holds are skipped, not waited for.
+   */
+  claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+  /** Saves the publication state of a message claimed by this same unit of work. */
+  update(message: OutboxMessage): void;
 }
 
 export interface Repositories {
   wallets: WalletRepository;
   transactions: WagerTransactionRepository;
   ledger: LedgerRepository;
+  inbox: InboxRepository;
   outbox: OutboxRepository;
 }
 
