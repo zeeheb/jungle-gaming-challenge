@@ -19,6 +19,8 @@ function readInt(name: string, fallback: number): number {
 export const env = {
   port: readInt('PORT', 3000),
   databaseUrl: read('DATABASE_URL', 'postgres://wagering:wagering@localhost:5432/wagering'),
+  // How long a request waits for a busy wallet before giving up with a retryable error.
+  lockTimeoutMs: readInt('DB_LOCK_TIMEOUT_MS', 5_000),
   sqs: {
     endpoint: read('SQS_ENDPOINT', 'http://localhost:4566'),
     region: read('AWS_REGION', 'us-east-1'),

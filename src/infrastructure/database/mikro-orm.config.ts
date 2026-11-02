@@ -1,11 +1,11 @@
 import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
 import { env } from '../../config/env';
+import { entities } from './entities';
 
 export default defineConfig({
   clientUrl: env.databaseUrl,
-  entities: [],
-  discovery: { warnWhenNoEntities: false },
+  entities,
   extensions: [Migrator],
   preferTs: true,
   forceUtcTimezone: true,
