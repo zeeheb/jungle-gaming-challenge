@@ -15,6 +15,14 @@ function readInt(name: string, fallback: number): number {
   return value;
 }
 
+function readBool(name: string, fallback: boolean): boolean {
+  const raw = read(name, String(fallback)).toLowerCase();
+  if (raw !== 'true' && raw !== 'false') {
+    throw new Error(`Environment variable ${name} must be true or false, got "${raw}"`);
+  }
+  return raw === 'true';
+}
+
 // Defaults match docker-compose.yml so `bun run dev` works without a .env file.
 export const env = {
   port: readInt('PORT', 3000),
@@ -31,6 +39,21 @@ export const env = {
     transactionsQueue: read('SQS_TRANSACTIONS_QUEUE', 'wager-transactions.fifo'),
     transactionsDlq: read('SQS_TRANSACTIONS_DLQ', 'wager-transactions-dlq.fifo'),
     eventsQueue: read('SQS_EVENTS_QUEUE', 'wager-events.fifo'),
+  },
+  consumer: {
+    enabled: readBool('CONSUMER_ENABLED', true),
+    waitTimeSeconds: readInt('CONSUMER_WAIT_TIME_SECONDS', 10),
+    maxMessages: readInt('CONSUMER_MAX_MESSAGES', 10),
+    // same as the queue's maxReceiveCount (docker/ministack/ready.d)
+    maxAttempts: readInt('CONSUMER_MAX_ATTEMPTS', 5),
+    // retries after 2s, 4s, 8s, 16s: about half a minute before the DLQ
+    retryBaseDelayMs: readInt('CONSUMER_RETRY_BASE_MS', 2_000),
+    retryMaxDelayMs: readInt('CONSUMER_RETRY_MAX_MS', 60_000),
+  },
+  outbox: {
+    enabled: readBool('OUTBOX_RELAY_ENABLED', true),
+    batchSize: readInt('OUTBOX_BATCH_SIZE', 10),
+    pollIntervalMs: readInt('OUTBOX_POLL_INTERVAL_MS', 500),
   },
 } as const;
 
