@@ -1,6 +1,6 @@
 # Arquitetura
 
-Documento vivo: cada seção entra junto com o código que ela descreve. Mensageria (SQS, outbox) ainda será detalhada.
+Documento vivo: cada seção entra junto com o código que ela descreve.
 
 ## Visão geral
 
@@ -15,6 +15,7 @@ src/
   application/      casos de uso e portas (UnitOfWork, repositórios): sem NestJS, sem ORM
   infrastructure/   adaptadores: PostgreSQL (MikroORM) e SQS
   http/             controllers, contratos de resposta e o filtro de erros
+  workers/          laços em segundo plano (consumidor SQS, relay da outbox) e o desligamento gracioso
   health/           liveness e readiness
   app.module.ts     composição: o único lugar que liga as peças
 ```
@@ -149,6 +150,7 @@ Todos são terminais para aquela `Idempotency-Key`. Reenviar o mesmo payload dev
 
 - `InboxMessage` registra uma mensagem já tratada por um consumidor e é gravada **na mesma transação SQL** que os efeitos dela.
 - `OutboxMessage` tenta publicar **para sempre**, com backoff de 1s até 60s. Perder um evento confirmado não é aceitável; uma mensagem travada aparece como *outbox lag* nas métricas, e não é descartada.
+- Como as duas são usadas pelo consumidor e pelo relay está na seção [Mensageria](#mensageria).
 
 ### Identificadores
 
@@ -304,7 +306,7 @@ O mapeamento é o mesmo em todos os endpoints. O status sozinho já diz ao prove
 | Wallet ou transação inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` | corrige |
 | Mesma chave com outro payload; wallet duplicada | 409 | `IDEMPOTENCY_CONFLICT`, `WALLET_ALREADY_EXISTS` | não é replay: uma operação nova pede uma chave nova |
 | Falha transitória (lock timeout, deadlock, banco indisponível) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` | reenvia a mesma requisição |
-| `FAILED` (desistimos depois de falhas de infraestrutura) | 500 | `status: FAILED`, `PROCESSING_FAILED` | aciona o suporte |
+| `FAILED` (reservado; ver [Mensageria](#por-que-nada-vira-failed-automaticamente)) | 500 | `status: FAILED`, `PROCESSING_FAILED` | aciona o suporte |
 | Bug nosso | 500 | `INTERNAL_ERROR`, sem detalhes internos | — |
 
 - **Uma transação nova responde 200, e não 201.** O replay precisa ter exatamente a resposta original, então o status depende só do resultado gravado.
@@ -344,3 +346,70 @@ Para conferir que os testes realmente pegam erros, fiz duas mutações. Sem o `F
 - As consultas `GET` usam a mesma unidade de trabalho e abrem uma transação curta. O custo é pequeno e o código fica com um caminho só.
 - `FAILED` responde 500: nenhum status HTTP diz exatamente "desista desta chave". O campo `status` do corpo é a fonte da verdade.
 - Ainda não há autenticação: a decisão e o ponto de extensão entram junto com a documentação final.
+
+## Mensageria
+
+Toda instância roda a API HTTP e, em segundo plano, dois laços: o consumidor de `wager-transactions.fifo` e o relay da outbox para `wager-events.fifo`. Cada um pode ser desligado por ambiente (`CONSUMER_ENABLED`, `OUTBOX_RELAY_ENABLED`), por exemplo para escalar consumidores separados da API.
+
+### Consumidor de transações
+
+- **Mesmo caso de uso do HTTP.** `ConsumeWagerMessage` só lê a mensagem e classifica o resultado; quem decide é `ProcessWagerTransaction`, com as mesmas regras, o mesmo lock e a mesma idempotência. A única diferença é o recibo da inbox.
+- **Inbox no mesmo commit.** A linha `(consumer_name, message_id)` é gravada na **mesma transação** que a transação, o lançamento, a wallet e a outbox: ou tudo, ou nada. A chave é o `messageId` do corpo, que é do produtor e se mantém nos reenvios. O `MessageId` do SQS muda a cada envio, então não serve.
+- **A inbox é consultada depois do lock da wallet.** Duas entregas da mesma mensagem apontam para a mesma wallet, então fazem fila, e a segunda enxerga o registro da primeira. Mensagem já vista com o mesmo conteúdo vira replay; com outro conteúdo, é `MESSAGE_CONFLICT` (produtor com defeito).
+- **Ack (`DeleteMessage`) só depois do commit.** Se o processo morre entre o commit e o ack, o SQS reentrega a mensagem; a inbox e a chave de idempotência transformam a reentrega num simples ack, sem efeito novo.
+
+| Resultado | Exemplos | O que o consumidor faz |
+|---|---|---|
+| De negócio (final) | `PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, replay | ack |
+| Permanente | JSON inválido, tipo desconhecido, payload inválido, wallet inexistente, `IDEMPOTENCY_CONFLICT`, `MESSAGE_CONFLICT` | DLQ na hora, com `failureCode`, `failureReason` e `attempts` |
+| Transitório | lock timeout, deadlock, banco indisponível | devolve à fila com backoff: a mensagem fica invisível por 2 s, 4 s, 8 s, 16 s |
+| Inesperado (bug) | qualquer outro erro | igual ao transitório, mas registrado como erro |
+| Tentativas esgotadas | 5ª entrega ainda falhando | DLQ, com o último erro |
+
+- **Dois limites de tentativas.** O nosso (`CONSUMER_MAX_ATTEMPTS = 5`) move a mensagem para a DLQ anexando o motivo. O *redrive* do SQS (`maxReceiveCount = 5`) é a rede de segurança para a mensagem que derruba o processo antes de qualquer decisão (*poison message*).
+- **Ordem:** o grupo FIFO é a wallet. Mensagens do mesmo grupo são tratadas em sequência; grupos diferentes, em paralelo. Quando uma mensagem volta para retry, as seguintes do grupo também voltam, para não passarem na frente. A ordem é otimização: a correção vem do banco (uma reversão que chega antes da aposta espera como `PENDING_REFERENCE`).
+- **Desligamento (SIGTERM).** `enableShutdownHooks` chama `beforeApplicationShutdown`, que para os laços. O long poll em andamento é cancelado. A mensagem que está sendo processada termina e recebe ack. As que foram recebidas mas não começaram voltam para a fila na hora (visibilidade 0), em vez de esperar os 30 s do timeout. Banco e SQS só fecham depois, em `onApplicationShutdown`.
+- **Rastreio:** o formato da mensagem não tem `correlationId`, então a própria mensagem inicia a cadeia: `correlationId` e `causationId` dos eventos são o `messageId`.
+
+### Por que nada vira `FAILED` automaticamente
+
+Uma mensagem que esgota as tentativas vai para a DLQ, de onde um operador pode reprocessá-la (*redrive*) depois de corrigir a causa. Se o consumidor gravasse a transação como `FAILED`, ela ficaria terminal e congelaria a `Idempotency-Key`: o reprocessamento viraria um replay do `FAILED`, e a recuperação ficaria bloqueada. Por isso `FAILED` continua no modelo e no schema, mas é reservado para uma decisão explícita de desistir de uma mensagem da DLQ (uma ferramenta de operação, fora do escopo).
+
+### Relay da outbox
+
+1. Numa transação: `SELECT ... FOR UPDATE SKIP LOCKED` das mensagens pendentes já vencidas, as mais antigas primeiro, em lotes de 10.
+2. Publica o lote no SQS (`SendMessageBatch`, com timeout de 5 s).
+3. Marca cada mensagem como publicada, ou agenda nova tentativa com backoff (1 s → 60 s, sem limite), e faz commit.
+
+- **Vários relays ao mesmo tempo** (um por instância) dividem o trabalho: as linhas ficam travadas enquanto são publicadas, e o `SKIP LOCKED` faz os outros pularem essas linhas em vez de esperar por elas.
+- **Pelo menos uma vez.** Se o processo morre depois de o SQS aceitar o lote e antes do commit, as linhas continuam pendentes e são publicadas de novo. Isso é seguro: o `eventId` é o `MessageDeduplicationId` (o SQS descarta a cópia dentro de 5 minutos), e os consumidores deduplicam pelo `eventId` depois disso.
+- **Grupo FIFO = `aggregateId` (a wallet).** Dentro de um relay, os eventos de uma wallet saem na ordem do commit.
+- **Broker fora do ar:** o publicador nunca lança exceção. Nada é aceito, e tudo é reagendado com backoff. Nenhum evento confirmado se perde.
+- Nada é publicado antes do commit, por construção: os eventos só existem na outbox, gravados pela própria transação que mudou o dinheiro.
+
+### Testes de mensageria
+
+Rodam contra o MiniStack real. Cada teste cria as próprias filas FIFO (com o mesmo *redrive* das reais) e as apaga no fim.
+
+| Cenário | Teste |
+|---|---|
+| Atomicidade: inbox, transação, ledger e eventos no mesmo commit; nada gravado enquanto falha | `wager-consumer.test.ts` |
+| Reentrega da mesma mensagem → um débito, uma linha na inbox | `wager-consumer.test.ts` |
+| Crash entre o commit e o ack → a reentrega só faz ack | `wager-consumer.test.ts` |
+| Rejeição de negócio → ack; erros permanentes → DLQ na hora, com o motivo | `wager-consumer.test.ts` |
+| Erro transitório → backoff (mensagem invisível), depois sucesso; esgotou → DLQ com o último erro | `wager-consumer.test.ts` |
+| Ordem do grupo: `BET` e `REFUND` no mesmo lote → o `REFUND` não espera | `wager-consumer.test.ts` |
+| SIGTERM: a mensagem em andamento termina; as não iniciadas voltam na hora | `wager-consumer.test.ts` |
+| Publicação com grupo e dedup, na ordem do commit | `outbox-relay.test.ts` |
+| Três relays na mesma outbox → cada evento entregue ao broker exatamente uma vez | `outbox-relay.test.ts` |
+| Relay morre depois de publicar e antes do commit → republica, e o SQS descarta a cópia | `outbox-relay.test.ts` |
+| Broker fora do ar → backoff, e depois publica | `outbox-relay.test.ts` |
+
+Mutação de controle: sem o `SKIP LOCKED` (sem lock nenhum), o teste dos três relays falha, porque cada evento é entregue 3 vezes.
+
+### Trade-offs e limitações
+
+- **A transação do relay fica aberta durante a chamada ao SQS.** O que limita esse tempo é o timeout de 5 s e o lote de 10. A alternativa seria uma coluna de *lease* (reservar a linha numa transação, publicar fora dela e marcar em outra): mais robusta para lotes grandes, mas com uma coluna e um estado a mais.
+- **Entre relays concorrentes, os eventos de uma wallet podem se intercalar** (o relay A pega e1, o relay B pega e2, e o B envia primeiro). Os consumidores têm o `walletVersion` (em `WalletBalanceChanged`) para ordenar e o `eventId` para deduplicar. Ordem estrita por wallet exigiria reservar por agregado.
+- **Com o banco fora do ar, o consumidor gasta as tentativas:** cerca de 30 s até a DLQ. Um *circuit breaker* que pausasse o consumo enquanto o banco está indisponível evitaria encher a DLQ numa queda longa.
+- **No Windows, o ambiente de desenvolvimento não tem SIGTERM de verdade.** Os testes chamam o mesmo caminho de desligamento diretamente (`PollingLoop.stop`). No contêiner Linux, o SIGTERM chega normalmente.
