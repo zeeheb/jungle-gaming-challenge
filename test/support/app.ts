@@ -10,6 +10,8 @@ export interface ApiResponse {
 
 export interface Api {
   get(path: string): Promise<ApiResponse>;
+  /** For non-JSON responses, such as GET /metrics. */
+  getText(path: string): Promise<{ status: number; body: string }>;
   post(path: string, body: unknown, headers?: Record<string, string>): Promise<ApiResponse>;
   /** Sends `rawBody` untouched, for malformed JSON. */
   postRaw(path: string, rawBody: string, headers?: Record<string, string>): Promise<ApiResponse>;
@@ -46,6 +48,10 @@ function apiClient(baseUrl: string): Api {
   };
   return {
     get: (path) => send('GET', path),
+    getText: async (path) => {
+      const response = await fetch(`${baseUrl}${path}`);
+      return { status: response.status, body: await response.text() };
+    },
     post: (path, body, headers) => send('POST', path, JSON.stringify(body), headers),
     postRaw: (path, rawBody, headers) => send('POST', path, rawBody, headers),
   };
