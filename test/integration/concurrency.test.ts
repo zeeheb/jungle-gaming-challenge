@@ -190,9 +190,11 @@ describe('idempotency under races', () => {
 
     expect(response.status).toBe(409);
     expect(response.body.error.code).toBe('IDEMPOTENCY_CONFLICT');
-    // its whole database transaction was rolled back
+    // its whole database transaction was rolled back, including the outbox
+    // rows it had already inserted (the flush writes them first)
     expect(await balanceOf(app.api, mine.id)).toBe('100.00');
     expect(await countTransactions(sql, mine.id)).toBe(1);
+    expect(await sql(`select id from outbox_messages where aggregate_id = ?`, [mine.id])).toHaveLength(2); // the opening's
   });
 });
 
