@@ -55,6 +55,12 @@ export const env = {
     batchSize: readInt('OUTBOX_BATCH_SIZE', 10),
     pollIntervalMs: readInt('OUTBOX_POLL_INTERVAL_MS', 500),
   },
+  pendingReferences: {
+    enabled: readBool('PENDING_REFERENCE_WORKER_ENABLED', true),
+    batchSize: readInt('PENDING_REFERENCE_BATCH_SIZE', 20),
+    // the shortest backoff is 1s, so checking every 500ms keeps the delay close to it
+    pollIntervalMs: readInt('PENDING_REFERENCE_POLL_INTERVAL_MS', 500),
+  },
 } as const;
 
 export type Env = typeof env;

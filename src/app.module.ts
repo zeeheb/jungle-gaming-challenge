@@ -7,6 +7,7 @@ import { RelayOutbox } from './application/messaging/relay-outbox';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/unit-of-work';
 import { ConsumeWagerMessage } from './application/wagering/consume-wager-message';
 import { ProcessWagerTransaction } from './application/wagering/process-wager-transaction';
+import { RetryPendingReferences } from './application/wagering/retry-pending-references';
 import { WagerTransactionQueries } from './application/wagering/wager-transaction-queries';
 import { OpenWallet } from './application/wallets/open-wallet';
 import { WalletQueries } from './application/wallets/wallet-queries';
@@ -32,8 +33,12 @@ function useCase<T>(type: new (unitOfWork: UnitOfWork) => T): FactoryProvider<T>
 
 const WORKER_ERROR_DELAY_MS = 1_000;
 
-/** Every instance runs the HTTP API and, unless disabled, both background loops. */
-function backgroundLoops(consumer: SqsWagerConsumer, relay: RelayOutbox): PollingLoop[] {
+/** Every instance runs the HTTP API and, unless disabled, the three background loops. */
+function backgroundLoops(
+  consumer: SqsWagerConsumer,
+  relay: RelayOutbox,
+  pendingReferences: RetryPendingReferences,
+): PollingLoop[] {
   const loops: PollingLoop[] = [];
   if (env.consumer.enabled) {
     loops.push(
@@ -52,6 +57,16 @@ function backgroundLoops(consumer: SqsWagerConsumer, relay: RelayOutbox): Pollin
         // a full batch means there is probably more waiting
         tick: async () => (await relay.relayBatch()).claimed === env.outbox.batchSize,
         idleDelayMs: env.outbox.pollIntervalMs,
+        errorDelayMs: WORKER_ERROR_DELAY_MS,
+      }),
+    );
+  }
+  if (env.pendingReferences.enabled) {
+    loops.push(
+      new PollingLoop({
+        name: 'PendingReferenceWorker',
+        tick: async () => (await pendingReferences.runOnce()).due === env.pendingReferences.batchSize,
+        idleDelayMs: env.pendingReferences.pollIntervalMs,
         errorDelayMs: WORKER_ERROR_DELAY_MS,
       }),
     );
@@ -101,10 +116,15 @@ function backgroundLoops(consumer: SqsWagerConsumer, relay: RelayOutbox): Pollin
       inject: [UNIT_OF_WORK, SQSClient],
     },
     {
+      provide: RetryPendingReferences,
+      useFactory: (unitOfWork: UnitOfWork) => new RetryPendingReferences(unitOfWork, env.pendingReferences.batchSize),
+      inject: [UNIT_OF_WORK],
+    },
+    {
       provide: BackgroundWorkers,
-      useFactory: (consumer: SqsWagerConsumer, relay: RelayOutbox) =>
-        new BackgroundWorkers(backgroundLoops(consumer, relay)),
-      inject: [SqsWagerConsumer, RelayOutbox],
+      useFactory: (consumer: SqsWagerConsumer, relay: RelayOutbox, pendingReferences: RetryPendingReferences) =>
+        new BackgroundWorkers(backgroundLoops(consumer, relay, pendingReferences)),
+      inject: [SqsWagerConsumer, RelayOutbox, RetryPendingReferences],
     },
   ],
 })
