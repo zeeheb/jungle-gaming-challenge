@@ -9,7 +9,7 @@ export interface ApiResponse {
 }
 
 export interface Api {
-  get(path: string): Promise<ApiResponse>;
+  get(path: string, headers?: Record<string, string>): Promise<ApiResponse>;
   /** For non-JSON responses, such as GET /metrics. */
   getText(path: string): Promise<{ status: number; body: string }>;
   post(path: string, body: unknown, headers?: Record<string, string>): Promise<ApiResponse>;
@@ -47,7 +47,7 @@ function apiClient(baseUrl: string): Api {
     return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) : undefined };
   };
   return {
-    get: (path) => send('GET', path),
+    get: (path, headers) => send('GET', path, undefined, headers),
     getText: async (path) => {
       const response = await fetch(`${baseUrl}${path}`);
       return { status: response.status, body: await response.text() };
