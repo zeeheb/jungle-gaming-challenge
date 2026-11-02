@@ -11,9 +11,11 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:chaos": "bun test test/chaos",
+    "test:load": "bun scripts/load-test.ts",
     "migration:create": "bun scripts/migrations.ts create",
     "migration:up": "bun scripts/migrations.ts up",
-    "migration:down": "bun scripts/migrations.ts down"
+    "migration:down": "bun scripts/migrations.ts down",
+    "send-message": "bun scripts/send-message.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1161.0",
