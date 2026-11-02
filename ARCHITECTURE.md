@@ -15,7 +15,7 @@ src/
   application/      casos de uso e portas (UnitOfWork, repositórios): sem NestJS, sem ORM
   infrastructure/   adaptadores: PostgreSQL (MikroORM) e SQS
   http/             controllers, contratos de resposta e o filtro de erros
-  workers/          laços em segundo plano (consumidor SQS, relay da outbox) e o desligamento gracioso
+  workers/          laços em segundo plano (consumidor SQS, relay da outbox, referências pendentes) e o desligamento gracioso
   health/           liveness e readiness
   app.module.ts     composição: o único lugar que liga as peças
 ```
@@ -158,7 +158,10 @@ UUIDv7 (`Bun.randomUUIDv7()`). Como começa pelo timestamp, as chaves novas entr
 
 ## Schema: as garantias ficam no banco
 
-O banco é a última linha de defesa (regra 9). Se a aplicação tiver um bug, a transação SQL falha em vez de gravar um estado inválido. Há duas migrations, ambas reversíveis: `initial_schema` (tabelas, constraints e índices) e `integrity_triggers` (o que um `CHECK` não consegue expressar).
+O banco é a última linha de defesa (regra 9). Se a aplicação tiver um bug, a transação SQL falha em vez de gravar um estado inválido. As migrations são reversíveis e só avançam:
+- `initial_schema`: tabelas, constraints e índices;
+- `integrity_triggers`: o que um `CHECK` não consegue expressar;
+- `transaction_correlation_id`: uma evolução posterior, explicada no [worker de referências pendentes](#worker-de-referências-pendentes).
 
 | Garantia | Como |
 |---|---|
@@ -289,7 +292,7 @@ A idempotência tem três camadas, todas no banco (nenhum cache em memória):
 - **Mesma chave em wallets diferentes:** a busca não enxerga a linha que a outra requisição ainda não confirmou. O `INSERT` bloqueia no índice único e falha quando a outra faz commit. A porta converte a falha em `DuplicateTransactionError`, o caso de uso busca de novo e responde 409, porque o `walletId` entra no hash. Há um teste determinístico para isso.
 - **Constraints únicas:** a última palavra é sempre do banco.
 
-O replay devolve o resultado gravado (`status`, `failureCode` e o `resultingBalance` daquele momento), mesmo que o saldo já tenha mudado. O `walletId` é normalizado para minúsculas antes do hash, porque o PostgreSQL guarda `uuid` assim. Sem isso, o mesmo pedido escrito com outra caixa daria conflito.
+O replay devolve o resultado gravado (`status`, `failureCode` e o `resultingBalance` daquele momento), mesmo que o saldo já tenha mudado. Uma transação que estava esperando a referência é a exceção natural: o replay responde 202 enquanto ela espera, e o resultado final (200 ou 422) depois que o worker decide. O `walletId` é normalizado para minúsculas antes do hash, porque o PostgreSQL guarda `uuid` assim. Sem isso, o mesmo pedido escrito com outra caixa daria conflito.
 
 ## API HTTP
 
@@ -349,7 +352,7 @@ Para conferir que os testes realmente pegam erros, fiz duas mutações. Sem o `F
 
 ## Mensageria
 
-Toda instância roda a API HTTP e, em segundo plano, dois laços: o consumidor de `wager-transactions.fifo` e o relay da outbox para `wager-events.fifo`. Cada um pode ser desligado por ambiente (`CONSUMER_ENABLED`, `OUTBOX_RELAY_ENABLED`), por exemplo para escalar consumidores separados da API.
+Toda instância roda a API HTTP e, em segundo plano, três laços: o consumidor de `wager-transactions.fifo`, o relay da outbox para `wager-events.fifo` e o [worker de referências pendentes](#worker-de-referências-pendentes). Cada um pode ser desligado por ambiente (`CONSUMER_ENABLED`, `OUTBOX_RELAY_ENABLED`, `PENDING_REFERENCE_WORKER_ENABLED`), por exemplo para escalar consumidores separados da API.
 
 ### Consumidor de transações
 
@@ -413,3 +416,39 @@ Mutação de controle: sem o `SKIP LOCKED` (sem lock nenhum), o teste dos três 
 - **Entre relays concorrentes, os eventos de uma wallet podem se intercalar** (o relay A pega e1, o relay B pega e2, e o B envia primeiro). Os consumidores têm o `walletVersion` (em `WalletBalanceChanged`) para ordenar e o `eventId` para deduplicar. Ordem estrita por wallet exigiria reservar por agregado.
 - **Com o banco fora do ar, o consumidor gasta as tentativas:** cerca de 30 s até a DLQ. Um *circuit breaker* que pausasse o consumo enquanto o banco está indisponível evitaria encher a DLQ numa queda longa.
 - **No Windows, o ambiente de desenvolvimento não tem SIGTERM de verdade.** Os testes chamam o mesmo caminho de desligamento diretamente (`PollingLoop.stop`). No contêiner Linux, o SIGTERM chega normalmente.
+
+## Worker de referências pendentes
+
+Uma `REFUND`, `ROLLBACK`, `WIN` ou `LOSS` que chega antes da transação referenciada é gravada como `PENDING_REFERENCE`, com a próxima consulta agendada (`next_reference_attempt_at`). O `RetryPendingReferences` (seção 7.1 do enunciado) roda em segundo plano a cada 500 ms e:
+
+1. busca, sem lock, as transações pendentes cuja consulta já venceu, as mais antigas primeiro (índice parcial `wager_transactions_pending_reference_idx`);
+2. para cada uma, abre uma transação do banco própria, trava a wallet (`FOR UPDATE`) e **relê** a transação;
+3. se ela ainda estiver pendente e vencida, roda a mesma liquidação do caso de uso principal (`settleAndRecord`): se a referência chegou e é válida, a transação é processada; se é inválida, rejeitada com o código específico; se ainda falta, a próxima consulta é agendada com backoff, sem novo evento;
+4. na 10ª consulta sem referência: `REJECTED` com `REFERENCE_NOT_FOUND`, e o `WagerTransactionRejected` vai para a outbox.
+
+- **Mesma regra, mesmo código.** O que muda entre uma transação que chega agora e uma que é retomada depois é só "inserir" ou "atualizar" a linha. As regras, o lock, o ledger e os eventos passam pelo mesmo `settleAndRecord`.
+- **Vários workers ao mesmo tempo** (um por instância) podem pegar a mesma linha. O lock da wallet os coloca em fila, e o segundo, ao reler a transação, vê que ela já foi resolvida e a pula. A ordem dos locks é a mesma do resto do sistema (a wallet primeiro), então não há deadlock com requisições HTTP ou mensagens da fila.
+- **Cadeias se resolvem numa rodada.** Um `ROLLBACK` de um `REFUND` que espera uma `BET`: quando a `BET` chega, o `REFUND` (agendado antes) é processado primeiro, e o `ROLLBACK` logo depois encontra o `REFUND` já final.
+- **Wallet ocupada:** se o lock passar do `lock_timeout`, a transação fica para a próxima rodada (`busy`), sem gastar tentativa.
+- **Rastreio:** os eventos decididos pelo worker carregam o `correlationId` da requisição que criou a transação. Para isso, ele passou a ser gravado na transação (migration `transaction_correlation_id`). A coluna aceita nulo de propósito: as linhas antigas não têm o que recuperar, e preencher transações terminais exigiria contornar o trigger que as congela. Ele não entra no hash do payload, porque não é campo de negócio.
+
+| Cenário | Teste (`pending-reference-worker.test.ts`) |
+|---|---|
+| `REFUND`/`ROLLBACK` antes da `BET` → processado quando a `BET` chega; replay passa a dizer `PROCESSED` | cenário 7 da seção 13 |
+| Backoff 2 s, 4 s, 8 s… entre consultas, um único evento de espera | |
+| 10ª consulta → `REFERENCE_NOT_FOUND`, 511 s depois da primeira | |
+| `ROLLBACK` de `REFUND` de `BET` atrasada → tudo resolvido numa rodada | |
+| Dois `REFUND`s esperando a mesma `BET` → o segundo vira `REFERENCE_ALREADY_REVERSED` | |
+| Três workers nas mesmas linhas → cada transação liquidada uma vez | |
+| Wallet travada além do timeout → fica para a rodada seguinte | |
+
+O tempo dos testes é controlado passando a hora agendada para `runOnce(now)`. Por isso as 10 tentativas (cerca de 8,5 minutos no relógio real) rodam em milissegundos, sem `sleep`.
+
+Mutação de controle: sem o lock da wallet no worker, o teste dos três workers falha. Dois workers tentam creditar o mesmo `REFUND`, e o banco recusa o segundo crédito em `wallet_ledger_entries_transaction_wallet_key`: o dinheiro continua protegido pelo schema, mas a rodada termina em erro.
+
+### Trade-offs e limitações
+
+- **A chegada da referência não acorda quem espera.** O `REFUND` só é reavaliado na próxima consulta agendada, ou seja, até 1 s depois se ele acabou de chegar, ou mais se já esperou várias vezes. Para baixar essa latência, a própria transação que chega poderia antecipar o `next_reference_attempt_at` de quem a referencia; ficou de fora por simplicidade.
+- **Cada rodada processa as transações em sequência.** Com o lote de 20 e o poll de 500 ms, isso sobra para o volume esperado de mensagens fora de ordem. Paralelizar por wallet seria o próximo passo.
+- **A busca inicial não trava nada**, então dois workers podem perder tempo com a mesma linha. O efeito é só desperdício, nunca duplicidade (lock da wallet + releitura + constraints). Um `SKIP LOCKED` nas linhas pendentes evitaria o desperdício, mas traria um segundo tipo de lock (linha da transação antes da wallet) e o risco de inverter a ordem dos locks.
+
