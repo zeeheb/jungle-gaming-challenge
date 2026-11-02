@@ -1,6 +1,22 @@
 # Arquitetura
 
-Documento vivo: cada seção entra junto com o código que ela descreve.
+Como rodar está no [README](README.md). Este documento explica **por quê**: cada seção descreve uma parte do código, as decisões tomadas, as alternativas e as limitações.
+
+## Decisões em uma página
+
+| Tema | Decisão | Por quê |
+|---|---|---|
+| Dinheiro | `Money` com `bigint` de centavos; `numeric(20,2)` no banco; entrada só como string com no máximo 2 casas | exato, nunca arredonda; uma terceira casa decimal é bug de quem enviou e precisa aparecer |
+| Correção | regras puras no domínio (`settleWager`) **e** invariantes no schema (constraints e triggers, inclusive "saldo = soma do ledger" verificado no commit) | o domínio expressa a intenção, e o banco é a última linha de defesa contra bugs, scripts manuais e corridas |
+| Concorrência | lock pessimista por wallet (`SELECT … FOR UPDATE`), com `lock_timeout` | numa wallet quente, conflito é a regra: fila no banco em vez de retries; sem lock global; vale para qualquer número de instâncias |
+| Idempotência | `UNIQUE (provider, idempotency_key)` e `(provider, external_id)`; SHA-256 do JSON canônico dos campos de negócio; busca **depois** do lock | persistente, sem cache; a mesma chave com outro conteúdo é conflito, nunca replay |
+| Atomicidade | transação, lançamento, saldo, inbox e eventos num único commit | não existe estado intermediário do qual seja preciso se recuperar |
+| Mensageria | ack só depois do commit; inbox por `(consumidor, messageId)`; DLQ imediata para erros permanentes, backoff para os transitórios | entrega *at-least-once* com efeito *exactly-once* |
+| Outbox | relay com `FOR UPDATE SKIP LOCKED`; `eventId` = chave de deduplicação | vários publishers sem disputa; publicar de novo é seguro |
+| Fora de ordem | `PENDING_REFERENCE` com 10 consultas em backoff (cerca de 8,5 min), depois `REFERENCE_NOT_FOUND` | segundos resolvem quase tudo; o que não chega em minutos provavelmente nunca foi enviado |
+| ORM | MikroORM como Data Mapper: *records* para as tabelas, domínio reidratado por `rehydrate` | o domínio continua com construtor privado e sem decorators |
+| Arquitetura | portas na aplicação (`UnitOfWork`, `Telemetry`, `ProviderIdentity`), adaptadores na infraestrutura, composição só no `AppModule` | testes de unidade sem I/O e trocas de infraestrutura localizadas |
+| Autenticação | não implementada; ponto de extensão real e testado | vale 0 ponto; o desenho com Keycloak está documentado |
 
 ## Visão geral
 
@@ -12,9 +28,9 @@ src/
     wagering/       WagerTransaction, códigos de falha, hash de payload, settleWager
     events/         eventos de integração
     messaging/      InboxMessage e OutboxMessage
-  application/      casos de uso e portas (UnitOfWork, repositórios): sem NestJS, sem ORM
+  application/      casos de uso e portas (UnitOfWork, repositórios, Telemetry, ProviderIdentity): sem NestJS, sem ORM
   infrastructure/   adaptadores: PostgreSQL (MikroORM), SQS e observabilidade (logs JSON, Prometheus)
-  http/             controllers, contratos de resposta e o filtro de erros
+  http/             controllers, contratos de resposta, filtro de erros e guard de provedor
   workers/          laços em segundo plano (consumidor SQS, relay da outbox, referências pendentes) e o desligamento gracioso
   health/           liveness e readiness
   app.module.ts     composição: o único lugar que liga as peças
@@ -30,6 +46,7 @@ As dependências apontam para dentro: `http` e `infrastructure` dependem de `app
 | PostgreSQL | 18 | Versão estável atual. |
 | Migrations | escritas à mão (snapshot do MikroORM desligado) | O schema depende de `CHECK`, índices parciais e triggers que queremos revisar como SQL, e não gerados a partir das entidades. |
 | Filas | `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wager-events.fifo` | Criadas pelo script `docker/ministack/ready.d`. A DLQ recebe a mensagem após 5 recebimentos sem sucesso. |
+| Imagem da aplicação | `oven/bun:1.4.4-slim`, sem build (o Bun roda o TypeScript direto); `bun` é o PID 1 | Com o perfil `app` do compose: um serviço `migrate` (roda e termina), uma `api` e dois `worker`. Num contêiner Linux, o `docker stop` faz o desligamento gracioso em menos de 1 s, com código de saída 0. |
 
 ## Modelo de domínio
 
@@ -306,6 +323,8 @@ O mapeamento é o mesmo em todos os endpoints. O status sozinho já diz ao prove
 | Aceita, aguardando a referência | 202 | `status: PENDING_REFERENCE` | consulta depois pelo `GET` |
 | Rejeitada por regra de negócio | 422 | `failureCode` e o saldo observado | não reenvia a mesma chave; ver [códigos de falha](#códigos-de-falha) |
 | Payload inválido ou sem `Idempotency-Key` | 400 | `INVALID_PAYLOAD` | corrige; reenviar igual falha de novo |
+| Credenciais ausentes ou inválidas (com autenticação ligada) | 401 | `UNAUTHENTICATED` | obtém um token válido |
+| Autenticado como um provedor, agindo como outro | 403 | `PROVIDER_MISMATCH` | corrige o `providerId` |
 | Wallet ou transação inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` | corrige |
 | Mesma chave com outro payload; wallet duplicada | 409 | `IDEMPOTENCY_CONFLICT`, `WALLET_ALREADY_EXISTS` | não é replay: uma operação nova pede uma chave nova |
 | Falha transitória (lock timeout, deadlock, banco indisponível) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` | reenvia a mesma requisição |
@@ -348,7 +367,7 @@ Para conferir que os testes realmente pegam erros, fiz duas mutações. Sem o `F
 - Replays também passam pelo lock, porque a busca vem depois dele. Buscar antes seria uma otimização só para replays, e ainda exigiria repetir a busca depois do lock. Ficou de fora por simplicidade.
 - As consultas `GET` usam a mesma unidade de trabalho e abrem uma transação curta. O custo é pequeno e o código fica com um caminho só.
 - `FAILED` responde 500: nenhum status HTTP diz exatamente "desista desta chave". O campo `status` do corpo é a fonte da verdade.
-- Ainda não há autenticação: a decisão e o ponto de extensão entram junto com a documentação final.
+- Autenticação: ver a seção [Autenticação](#autenticação). O ponto de extensão existe e já devolve 401 e 403 quando um adaptador real é plugado.
 
 ## Mensageria
 
@@ -527,3 +546,64 @@ Os casos de uso dizem **o que aconteceu**, em termos de negócio, por uma porta 
 - **Injeção de falha:** `FAULT_CRASH_AFTER_COMMIT` liga um gancho (`beforeAck`) do consumidor que encerra o processo entre o commit e o `DeleteMessage`, só para transações novas (uma reentrega é replay e passa). Ele fica desligado por padrão e existe apenas para estes testes.
 - **Estabilidade:** os três cenários rodaram 5 vezes seguidas sem falha, em cerca de 10 s cada execução. A espera é sempre por estado ("fila vazia, nada pendente, outbox publicada"), nunca por tempo fixo.
 - **Limitação:** no Windows, `SIGTERM` também mata o processo na hora, então o desligamento **gracioso** entre processos não é exercitado aqui. Ele é testado dentro do processo (`wager-consumer.test.ts`, chamando o mesmo `stop()` que o SIGTERM aciona).
+
+## Autenticação
+
+**Decisão:** não implementada. O enunciado não dá ponto para ela, aceita deixá-la de fora desde que documentada, e pede que, se feita, use um Identity Provider externo, e não autenticação artesanal. O tempo foi para correção, concorrência e idempotência.
+
+**O ponto de extensão é real.** A porta `ProviderIdentity` (`src/application/provider-identity.ts`) responde "qual provedor está chamando?". O `ProviderAuthGuard` a consulta em todas as rotas de `wagering`. A regra que usa a resposta já existe: um provedor só age como ele mesmo (`assertActsAsItself`). Um provedor autenticado como A que envia ou consulta uma transação de B recebe 403 `PROVIDER_MISMATCH`, e credenciais ausentes ou inválidas recebem 401 `UNAUTHENTICATED`. O adaptador atual (`AuthenticationDisabled`) responde "anônimo" e deixa todos passarem. O teste `provider-auth.test.ts` pluga um adaptador falso e mostra a aplicação aplicando as duas regras.
+
+**O desenho que eu adotaria (Keycloak):**
+
+1. Um *realm* `wagering` e um *client* confidencial por provedor, usando o fluxo *client credentials* (comunicação entre máquinas, sem usuário). O `client_id` é o `providerId`.
+2. O provedor pede um token ao Keycloak e o envia em `Authorization: Bearer <JWT>`.
+3. Um adaptador `KeycloakProviderIdentity` valida o JWT localmente com as chaves públicas do *realm* (JWKS, em cache, com rotação): assinatura, `iss`, `aud`, `exp`. Ele devolve o `azp`/`client_id` como `providerId`. Não há chamada ao Keycloak por requisição.
+4. Nada mais muda: o guard e a regra de "agir como si mesmo" já estão no lugar.
+5. Abertos, como o enunciado pede: `/health/*`. `/metrics` também, mas atrás da rede interna.
+6. A fila é canal interno confiável (políticas de IAM do SQS). O `providerId` da mensagem continua passando pelas mesmas validações de domínio (reservado `internal`, referência do mesmo provedor).
+7. Abrir wallet (`POST /wallets`) seria uma operação de *backoffice*, com outro *client* e um *scope* próprio, e não uma rota de provedor.
+
+## Mapa dos testes obrigatórios
+
+**Invariante final de todos os testes:** depois de cada teste de integração, uma consulta confere em **todas** as wallets do banco que o saldo é igual à soma do ledger (`inconsistentWallets`).
+
+| Seção 13 | Onde |
+|---|---|
+| **Unidade:** `Money` (escala, arredondamento, entradas inválidas) | `test/unit/money.test.ts` |
+| Invariantes da `Wallet` | `test/unit/wallet.test.ts`, `wallet-ledger-entry.test.ts` |
+| Regras de `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`; conflito de moeda | `test/unit/settle-wager.test.ts`, `wager-transaction.test.ts` |
+| Idempotency key com payload divergente | `test/unit/wager-transaction.test.ts` (hash), `test/integration/wagering-api.test.ts` (409) |
+| **Integração:** migrations e constraints | `test/integration/migrations.test.ts`, `schema.test.ts` |
+| Atomicidade entre wallet, ledger, inbox e outbox | `wager-consumer.test.ts` (tudo ou nada), `concurrency.test.ts` (rollback de INSERTs já executados) |
+| Inbox e redelivery | `wager-consumer.test.ts` |
+| Publishers concorrentes sobre a mesma outbox | `outbox-relay.test.ts` (3 relays), `test/chaos` (3 processos) |
+| Retry e DLQ | `wager-consumer.test.ts` |
+| Recuperação após reinicialização | `test/chaos/multi-instance.test.ts` |
+| **Concorrência:** a mesma aposta 50 vezes em paralelo → um débito | `concurrency.test.ts`; 30 vezes entre 3 processos em `test/chaos` |
+| Duas apostas de 80,00 com saldo de 100,00 | `concurrency.test.ts`; entre processos em `test/chaos` |
+| Wallets distintas em paralelo | `concurrency.test.ts` |
+| ≥ 3 processos simultâneos | `test/chaos/multi-instance.test.ts` |
+| Worker morto depois do commit e antes do ack | `test/chaos/multi-instance.test.ts` (processo real); `wager-consumer.test.ts` (no mesmo processo) |
+| Dois publishers sobre a mesma outbox | `outbox-relay.test.ts`, `test/chaos/multi-instance.test.ts` |
+| `ROLLBACK` ou `REFUND` entregue antes da referência | `pending-reference-worker.test.ts`, `wager-consumer.test.ts`, `test/chaos` |
+| Reinício com prova de consistência final | `test/chaos/multi-instance.test.ts` (reconciliação de todas as wallets) |
+
+**Controles de mutação feitos à mão:** removi de propósito, um de cada vez:
+- o `FOR UPDATE` da aposta;
+- o tratamento de `DuplicateTransactionError`;
+- o `SKIP LOCKED` da outbox;
+- o lock da wallet no worker.
+
+Em cada caso, o teste correspondente falhou. Em dois deles, o próprio schema impediu o estrago financeiro.
+
+## Limitações e próximos passos
+
+As limitações de cada parte estão nas seções acima. As que eu atacaria primeiro numa evolução para produção:
+
+1. **Vazão do relay da outbox:** é o gargalo medido no [teste de carga](docs/load-test.md). Lotes maiores com envios em paralelo e relays escalados à parte.
+2. **Autenticação com Keycloak**, pelo desenho acima.
+3. **Circuit breaker no consumidor:** pausar o consumo enquanto o banco está fora, em vez de gastar as tentativas e encher a DLQ.
+4. **Acordar transações pendentes** quando a referência chega, em vez de esperar a próxima consulta agendada.
+5. **Ferramenta de operação para a DLQ:** reprocessar (*redrive*) ou desistir explicitamente, gravando `FAILED`.
+6. **Usuários de banco separados:** um para migrations, dono das tabelas, e outro para a aplicação, sem `UPDATE` no ledger.
+7. **Tracing distribuído (OpenTelemetry)** e a métrica de idade da mensagem na fila.
