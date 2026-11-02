@@ -1,6 +1,7 @@
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
-import { Controller, Get, Inject, ServiceUnavailableException } from '@nestjs/common';
+import { Controller, Get, HttpStatus, Inject, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { env } from '../config/env';
 
 type CheckResult = { status: 'up' } | { status: 'down'; error: string };
@@ -20,18 +21,16 @@ export class HealthController {
   }
 
   @Get('ready')
-  async ready() {
+  async ready(@Res({ passthrough: true }) response: Response) {
     const [postgres, sqs] = await Promise.all([
       check(() => this.orm.em.getConnection().execute('select 1')),
       check(() => this.sqs.send(new GetQueueUrlCommand({ QueueName: env.sqs.transactionsQueue }))),
     ]);
 
     const ready = postgres.status === 'up' && sqs.status === 'up';
-    const body = { status: ready ? 'ok' : 'unavailable', checks: { postgres, sqs } };
-    if (!ready) {
-      throw new ServiceUnavailableException(body);
-    }
-    return body;
+    // the body says which dependency is down, so it is not routed through the error filter
+    response.status(ready ? HttpStatus.OK : HttpStatus.SERVICE_UNAVAILABLE);
+    return { status: ready ? 'ok' : 'unavailable', checks: { postgres, sqs } };
   }
 }
 
