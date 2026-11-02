@@ -1,6 +1,6 @@
 # Arquitetura
 
-Documento vivo: cada seção entra junto com o código que ela descreve. Concorrência na aplicação e mensageria ainda serão detalhadas.
+Documento vivo: cada seção entra junto com o código que ela descreve. Mensageria (SQS, outbox) ainda será detalhada.
 
 ## Visão geral
 
@@ -12,11 +12,14 @@ src/
     wagering/       WagerTransaction, códigos de falha, hash de payload, settleWager
     events/         eventos de integração
     messaging/      InboxMessage e OutboxMessage
+  application/      casos de uso e portas (UnitOfWork, repositórios): sem NestJS, sem ORM
   infrastructure/   adaptadores: PostgreSQL (MikroORM) e SQS
+  http/             controllers, contratos de resposta e o filtro de erros
   health/           liveness e readiness
+  app.module.ts     composição: o único lugar que liga as peças
 ```
 
-O domínio não importa nada de fora dele. Toda regra de negócio pode ser testada sem banco e sem fila (`bun run test:unit`). A infraestrutura cuida do que o domínio não pode garantir sozinho: locks, constraints e atomicidade.
+As dependências apontam para dentro: `http` e `infrastructure` dependem de `application`, que depende de `domain`, que não depende de nada. Toda regra de negócio pode ser testada sem banco e sem fila (`bun run test:unit`). A infraestrutura cuida do que o domínio não pode garantir sozinho: locks, constraints e atomicidade.
 
 ## Ambiente
 
@@ -216,3 +219,128 @@ As verificações 2 e 3 são **adiadas para o commit** (`DEFERRABLE INITIALLY DE
 ### Testes do schema
 
 `bun run test:integration` roda contra um PostgreSQL real (banco `wagering_test`, recriado a cada arquivo de teste; requer `docker compose up -d`). Como o schema proíbe `TRUNCATE`, os testes não limpam tabelas: cada teste usa ids novos. O teste de *lost update* é determinístico: dois escritores sem `FOR UPDATE` gravam a mesma versão, o primeiro só faz commit quando o segundo está comprovadamente bloqueado no índice (`pg_stat_activity`), e o segundo falha em `wallet_ledger_entries_wallet_version_key`.
+
+## Casos de uso e persistência
+
+### Portas e casos de uso
+
+Os casos de uso (`OpenWallet`, `ProcessWagerTransaction` e as consultas) são classes comuns, sem decorators. Eles recebem uma porta, `UnitOfWork`, que representa **uma transação do banco**: os repositórios entregues a `run()` só registram mudanças (`add`/`update`), e tudo é gravado junto quando o trabalho termina, ou nada é. O `AppModule` é o único lugar que sabe que a porta é implementada com MikroORM.
+
+A porta também traduz os erros do banco para o vocabulário da aplicação. O caso de uso nunca vê o nome de uma constraint:
+
+| Erro do PostgreSQL | Vira |
+|---|---|
+| `wager_transactions_provider_idempotency_key` / `_provider_external_key` | `DuplicateTransactionError` |
+| `wallets_player_currency_key` | `WalletAlreadyExistsError` |
+| `55P03` (lock timeout), `40P01` (deadlock), `40001`, conexão recusada ou derrubada | `TransientFailureError` |
+| qualquer outro | segue como está: é bug (500) |
+
+### MikroORM: Data Mapper com *records*
+
+- **As classes do domínio não são entidades do ORM.** Elas têm construtor privado, estado encapsulado e reidratação obrigatória por `rehydrate`; o ORM hidrataria objetos sem passar pela factory. Cada tabela tem um *record* (`defineEntity`, sem decorators) no formato da linha, e os repositórios convertem record ↔ domínio.
+- **Money** ocupa duas colunas: `numeric(20,2)` e `currency`. O record lê o valor com `p.decimal('string')`, que entrega a string exata do PostgreSQL (`"975.00"`), e só o mapper a transforma em `Money`. Não existe `number` em nenhum ponto do caminho.
+- **Unit of Work:** `em.transactional()` faz o flush e o commit. As relações many-to-one estão declaradas nos records só para o MikroORM inserir os pais antes dos filhos, já que as FKs não são adiadas.
+- **Identity Map:** cada unidade de trabalho usa um `EntityManager` novo (`em.fork()`), então nada é compartilhado entre requisições concorrentes. O repositório lembra qual record está por trás de cada `Wallet` que entregou. `update(wallet)` altera esse record, e o flush emite um `UPDATE` só das colunas que mudaram.
+
+O SQL de uma aposta, tirado do log do MikroORM (abreviado):
+
+```sql
+begin;
+set local lock_timeout = 5000;
+select * from wallets where id = $1 limit 1 for update;                          -- fila por wallet
+select * from wager_transactions where provider_id = $1 and idempotency_key = $2; -- replay?
+select * from wager_transactions where provider_id = $1 and external_transaction_id = $2;
+insert into outbox_messages (...) values (...), (...);                            -- os 2 eventos num INSERT
+insert into wager_transactions (...) values (...);
+insert into wallet_ledger_entries (...) values (...);
+update wallets set balance = $1, version = $2, updated_at = $3 where id = $4;
+commit;
+```
+
+Um replay para depois da busca por chave: `begin`, lock, `select`, `commit`.
+
+### Concorrência: lock pessimista por wallet
+
+`ProcessWagerTransaction` começa com `SELECT ... FOR UPDATE` na linha da wallet (`LockMode.PESSIMISTIC_WRITE`), **antes de ler qualquer outra coisa**, e segura o lock até o commit.
+
+- **Por que pessimista:** numa wallet quente, conflito é o caso normal, e não a exceção. Com lock otimista, cada conflito vira um retry que refaz o trabalho; em 100 apostas simultâneas, a maioria tentaria várias vezes. Com o lock, elas fazem fila no banco e cada uma roda uma vez só.
+- **Sem lock global:** o lock é da linha. Wallets diferentes nunca esperam umas pelas outras, e há um teste que prova isso com uma wallet travada.
+- **Várias instâncias:** o lock está no PostgreSQL, e não na memória do processo. Vale para qualquer número de instâncias e de consumidores.
+- **Sob o lock, ler, decidir e escrever não se intercalam.** Saldo, idempotência e "esta referência já foi revertida?" são lidos sabendo que ninguém muda a wallet até o commit. As reversões de uma referência válida estão na mesma wallet, então o mesmo lock as protege.
+- **`READ COMMITTED` basta.** Depois de conseguir o lock, cada instrução seguinte enxerga tudo o que já foi confirmado, inclusive a requisição duplicada que estava na frente na fila. `SERIALIZABLE` só acrescentaria retries.
+- **Sem deadlock entre apostas:** cada transação trava uma única wallet, então não há ciclo possível. Uma transferência entre wallets exigiria travar em ordem fixa (fora do escopo).
+- **Espera limitada:** `SET LOCAL lock_timeout` (padrão 5 s, `DB_LOCK_TIMEOUT_MS`). Se uma wallet fica presa (outra instância travou segurando o lock), a requisição recebe 503 com `Retry-After` em vez de acumular conexões. Reenviar é seguro, por causa da idempotência.
+- **Se o lock faltar, o banco ainda segura.** Num teste de mutação, removi o `FOR UPDATE`: nenhum saldo ficou errado, porque `UNIQUE (wallet_id, wallet_version)` e os triggers recusaram as escritas concorrentes. Mas, das 100 apostas da rajada, só 10 passaram, e o resto virou erro. As constraints protegem o dinheiro; o lock é o que transforma conflito em fila.
+
+### Fluxo de `ProcessWagerTransaction`
+
+1. Valida o payload e cria a transação em memória **antes** de abrir a transação do banco. Um payload inválido nunca pega lock.
+2. `BEGIN` e lock da wallet. Se ela não existe: 404, e nada é gravado.
+3. Busca por `(providerId, idempotencyKey)` e depois por `(providerId, externalTransactionId)`. Se acha: mesma chave e mesmo hash é **replay**; qualquer outra combinação é **conflito** (409).
+4. Resolve a referência e verifica se ela já foi revertida.
+5. `settleWager` decide (função pura do domínio).
+6. Registra transação, lançamento, wallet e eventos na outbox, e faz `COMMIT`.
+
+A idempotência tem três camadas, todas no banco (nenhum cache em memória):
+
+- **Mesma wallet:** o lock serializa as requisições. A segunda faz a busca depois do commit da primeira e vira replay. É o teste das 50 apostas iguais.
+- **Mesma chave em wallets diferentes:** a busca não enxerga a linha que a outra requisição ainda não confirmou. O `INSERT` bloqueia no índice único e falha quando a outra faz commit. A porta converte a falha em `DuplicateTransactionError`, o caso de uso busca de novo e responde 409, porque o `walletId` entra no hash. Há um teste determinístico para isso.
+- **Constraints únicas:** a última palavra é sempre do banco.
+
+O replay devolve o resultado gravado (`status`, `failureCode` e o `resultingBalance` daquele momento), mesmo que o saldo já tenha mudado. O `walletId` é normalizado para minúsculas antes do hash, porque o PostgreSQL guarda `uuid` assim. Sem isso, o mesmo pedido escrito com outra caixa daria conflito.
+
+## API HTTP
+
+### Status por situação
+
+O mapeamento é o mesmo em todos os endpoints. O status sozinho já diz ao provedor o que fazer:
+
+| Situação | Status | Corpo | O provedor... |
+|---|---|---|---|
+| Processada (primeira vez ou replay) | 200 | `transactionId`, `status`, `balance`, `idempotentReplay` | segue em frente |
+| Aceita, aguardando a referência | 202 | `status: PENDING_REFERENCE` | consulta depois pelo `GET` |
+| Rejeitada por regra de negócio | 422 | `failureCode` e o saldo observado | não reenvia a mesma chave; ver [códigos de falha](#códigos-de-falha) |
+| Payload inválido ou sem `Idempotency-Key` | 400 | `INVALID_PAYLOAD` | corrige; reenviar igual falha de novo |
+| Wallet ou transação inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` | corrige |
+| Mesma chave com outro payload; wallet duplicada | 409 | `IDEMPOTENCY_CONFLICT`, `WALLET_ALREADY_EXISTS` | não é replay: uma operação nova pede uma chave nova |
+| Falha transitória (lock timeout, deadlock, banco indisponível) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` | reenvia a mesma requisição |
+| `FAILED` (desistimos depois de falhas de infraestrutura) | 500 | `status: FAILED`, `PROCESSING_FAILED` | aciona o suporte |
+| Bug nosso | 500 | `INTERNAL_ERROR`, sem detalhes internos | — |
+
+- **Uma transação nova responde 200, e não 201.** O replay precisa ter exatamente a resposta original, então o status depende só do resultado gravado.
+- **422 é diferente de 400.** O 422 é um resultado final e gravado (consultável, com evento publicado). O 400 não grava nada.
+- **Erros têm um envelope único**, `{ "error": { "code", "message" } }`, produzido por um único filtro global. A exceção é o `/health/ready`, cujo corpo lista o estado de cada dependência.
+- **Um id de rota que não é UUID responde 404**, e não 400. Para o cliente o id é opaco; ele só precisa saber que aquele recurso não existe.
+- **`X-Correlation-Id`:** o valor recebido (ou um gerado) volta no header da resposta e vai no `correlationId` dos eventos.
+- **Campos desconhecidos são ignorados** e não entram no hash.
+- **Limites:** ids e `Idempotency-Key` têm até 255 caracteres.
+
+## Testes de integração da API
+
+Todos sobem a aplicação inteira (`@nestjs/testing`) numa porta aleatória e falam com ela por HTTP, contra o PostgreSQL real. Nada é mockado; só o teste de timeout troca um provider, para usar um `lock_timeout` de 200 ms.
+
+- **Proteção do banco de desenvolvimento:** o `bunfig.toml` pré-carrega `test/support/test-env.ts`, que aponta `DATABASE_URL` para `wagering_test`. Os helpers se recusam a rodar contra um banco cujo nome não termine em `_test`, porque eles apagam o schema.
+- **Invariante final:** depois de **cada** teste, uma consulta confere em todas as wallets do banco que o saldo é igual à soma do ledger e que `version` é a versão do último lançamento.
+- **Concorrência sem `sleep`:** quando a ordem importa, o próprio teste segura o lock de uma wallet (fazendo o papel de outra instância) e espera, via `pg_stat_activity`, até a requisição estar comprovadamente bloqueada.
+
+| Cenário (seção 13) | Teste |
+|---|---|
+| Mesma aposta 50 vezes em paralelo → um débito | `concurrency.test.ts` |
+| 100,00 de saldo e duas apostas de 80,00 → uma `PROCESSED`, uma `INSUFFICIENT_FUNDS`, saldo 20,00, um débito; os retries não mudam nada | `concurrency.test.ts` |
+| Rajada de 100 apostas distintas numa wallet de 50,00 → 50 aceitas, 50 rejeitadas, versões 1..51 sem buraco | `concurrency.test.ts` |
+| Wallets distintas em paralelo; uma wallet travada não atrasa outra | `concurrency.test.ts` |
+| Mesma chave em outra wallet, confirmada no meio da requisição → 409 | `concurrency.test.ts` |
+| Wallet presa além do `lock_timeout` → 503 e o retry funciona | `concurrency.test.ts` |
+| Replay, conflito, payload equivalente, chave por provedor, 400/404/422 | `wagering-api.test.ts` |
+| Rodada completa: `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, reversão dupla, reversão sem saldo, referência atrasada (202) | `wagering-api.test.ts` |
+| Abertura com `OPENING`, wallet vazia, duplicada (inclusive concorrente), validação | `wallets-api.test.ts` |
+
+Para conferir que os testes realmente pegam erros, fiz duas mutações. Sem o `FOR UPDATE`, três testes de concorrência falham. Sem o tratamento de `DuplicateTransactionError`, falha exatamente o teste da corrida entre wallets.
+
+### Trade-offs e limitações
+
+- Uma requisição esperando lock segura uma conexão do pool. Numa wallet muito quente, as outras wallets podem esperar por **conexão**, nunca por lock. A espera tem limite (`lock_timeout`). Na fila (fase 4), o grupo FIFO por wallet reduz essa disputa na origem.
+- Replays também passam pelo lock, porque a busca vem depois dele. Buscar antes seria uma otimização só para replays, e ainda exigiria repetir a busca depois do lock. Ficou de fora por simplicidade.
+- As consultas `GET` usam a mesma unidade de trabalho e abrem uma transação curta. O custo é pequeno e o código fica com um caminho só.
+- `FAILED` responde 500: nenhum status HTTP diz exatamente "desista desta chave". O campo `status` do corpo é a fonte da verdade.
+- Ainda não há autenticação: a decisão e o ponto de extensão entram junto com a documentação final.
