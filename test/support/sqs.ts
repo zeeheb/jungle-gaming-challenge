@@ -29,7 +29,7 @@ export interface TestQueues {
  * Throwaway FIFO queues for one test, configured like the real ones
  * (redrive to the DLQ after 5 receives), so tests never see each other's messages.
  */
-export async function createTestQueues(sqs: SQSClient): Promise<TestQueues> {
+export async function createTestQueues(sqs: SQSClient, visibilityTimeoutSeconds = 30): Promise<TestQueues> {
   const prefix = `test-${newId()}`;
   const create = async (name: string, attributes: Record<string, string> = {}) => {
     const { QueueUrl } = await sqs.send(
@@ -48,7 +48,7 @@ export async function createTestQueues(sqs: SQSClient): Promise<TestQueues> {
     new GetQueueAttributesCommand({ QueueUrl: deadLetter, AttributeNames: ['QueueArn'] }),
   );
   const transactions = await create(names.transactions, {
-    VisibilityTimeout: '30',
+    VisibilityTimeout: String(visibilityTimeoutSeconds),
     RedrivePolicy: JSON.stringify({ deadLetterTargetArn: Attributes!['QueueArn'], maxReceiveCount: '5' }),
   });
   const events = await create(names.events);
