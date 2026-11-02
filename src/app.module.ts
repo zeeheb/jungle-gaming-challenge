@@ -7,7 +7,7 @@ import { RelayOutbox } from './application/messaging/relay-outbox';
 import { TELEMETRY, type Telemetry } from './application/telemetry';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/unit-of-work';
 import { ConsumeWagerMessage } from './application/wagering/consume-wager-message';
-import { ProcessWagerTransaction } from './application/wagering/process-wager-transaction';
+import { ProcessWagerTransaction, type ProcessWagerResult } from './application/wagering/process-wager-transaction';
 import { RetryPendingReferences } from './application/wagering/retry-pending-references';
 import { WagerTransactionQueries } from './application/wagering/wager-transaction-queries';
 import { OpenWallet } from './application/wallets/open-wallet';
@@ -43,6 +43,16 @@ function useCase<T>(type: new (unitOfWork: UnitOfWork, telemetry: Telemetry) => 
 }
 
 const WORKER_ERROR_DELAY_MS = 1_000;
+
+/** Exit code of a process killed on purpose by fault injection. */
+export const FAULT_EXIT_CODE = 86;
+
+/** FAULT_CRASH_AFTER_COMMIT: die like a crash would, after the commit and before the ack. */
+function crashAfterCommit(result: ProcessWagerResult): void {
+  if (!result.replay) {
+    process.exit(FAULT_EXIT_CODE);
+  }
+}
 
 /** Every instance runs the HTTP API and, unless disabled, the three background loops. */
 function backgroundLoops(
@@ -137,7 +147,12 @@ function backgroundLoops(
         new SqsWagerConsumer(
           sqs,
           consume,
-          { ...env.consumer, queueName: env.sqs.transactionsQueue, deadLetterQueueName: env.sqs.transactionsDlq },
+          {
+            ...env.consumer,
+            queueName: env.sqs.transactionsQueue,
+            deadLetterQueueName: env.sqs.transactionsDlq,
+            beforeAck: env.faults.crashAfterCommit ? crashAfterCommit : undefined,
+          },
           metrics,
         ),
       inject: [SQSClient, ConsumeWagerMessage, WageringMetrics],

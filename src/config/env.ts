@@ -56,6 +56,11 @@ export const env = {
     batchSize: readInt('OUTBOX_BATCH_SIZE', 10),
     pollIntervalMs: readInt('OUTBOX_POLL_INTERVAL_MS', 500),
   },
+  // Chaos testing only: never set in a real deployment.
+  faults: {
+    // the process exits right after committing a new transaction, before acking its message
+    crashAfterCommit: readBool('FAULT_CRASH_AFTER_COMMIT', false),
+  },
   pendingReferences: {
     enabled: readBool('PENDING_REFERENCE_WORKER_ENABLED', true),
     batchSize: readInt('PENDING_REFERENCE_BATCH_SIZE', 20),

@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/client-sqs';
 import { Logger } from '@nestjs/common';
 import type { ConsumeWagerMessage, MessageOutcome } from '../../application/wagering/consume-wager-message';
+import type { ProcessWagerResult } from '../../application/wagering/process-wager-transaction';
 import { exponentialBackoff } from '../../domain/shared/backoff';
 import { logContext } from '../observability/log-context';
 import type { WageringMetrics } from '../observability/wagering-metrics';
@@ -27,6 +28,11 @@ export interface WagerConsumerOptions {
   maxAttempts: number;
   retryBaseDelayMs: number;
   retryMaxDelayMs: number;
+  /**
+   * Fault injection point, used by the chaos tests only: runs after the use
+   * case has committed and before the message is deleted.
+   */
+  beforeAck?: ((result: ProcessWagerResult) => void) | undefined;
 }
 
 /**
@@ -98,6 +104,7 @@ export class SqsWagerConsumer {
 
     try {
       if (outcome.action === 'ack') {
+        this.options.beforeAck?.(outcome.result);
         await this.delete(queueUrl, message);
         return true;
       }
