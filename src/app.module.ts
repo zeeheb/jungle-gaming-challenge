@@ -4,6 +4,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { Module, type FactoryProvider, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { RelayOutbox } from './application/messaging/relay-outbox';
+import { AuthenticationDisabled, PROVIDER_IDENTITY } from './application/provider-identity';
 import { TELEMETRY, type Telemetry } from './application/telemetry';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/unit-of-work';
 import { ConsumeWagerMessage } from './application/wagering/consume-wager-message';
@@ -104,6 +105,8 @@ function backgroundLoops(
   controllers: [HealthController, MetricsController, WalletsController, WageringController],
   providers: [
     { provide: APP_FILTER, useClass: ErrorResponseFilter },
+    // authentication is not implemented: see "Autenticação" in ARCHITECTURE.md
+    { provide: PROVIDER_IDENTITY, useClass: AuthenticationDisabled },
 
     // observability
     {

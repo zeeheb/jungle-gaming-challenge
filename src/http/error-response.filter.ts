@@ -10,6 +10,7 @@ import {
   WalletAlreadyExistsError,
   WalletNotFoundError,
 } from '../application/errors';
+import { ProviderMismatchError, UnauthenticatedError } from '../application/provider-identity';
 import { InvalidMoneyError } from '../domain/shared/money';
 import { InvalidWagerTransactionError } from '../domain/wagering/wager-transaction';
 import { InvalidWalletOperationError } from '../domain/wallet/wallet';
@@ -25,6 +26,8 @@ type ErrorClass = abstract new (...args: never[]) => Error;
  * same status on every endpoint. The status alone tells a provider what to do:
  *
  *   400  the request is malformed: fix it, resending it as is fails again
+ *   401  credentials missing or invalid (once authentication is enabled)
+ *   403  authenticated as one provider, acting as another
  *   404  the wallet or transaction does not exist
  *   409  clashes with what exists (Idempotency-Key reused, wallet already open)
  *   503  temporary: resending the same request is safe and may work (Retry-After)
@@ -38,6 +41,8 @@ const STATUS_BY_ERROR: ReadonlyArray<[ErrorClass, HttpStatus]> = [
   [InvalidMoneyError, HttpStatus.BAD_REQUEST],
   [InvalidWagerTransactionError, HttpStatus.BAD_REQUEST],
   [InvalidWalletOperationError, HttpStatus.BAD_REQUEST],
+  [UnauthenticatedError, HttpStatus.UNAUTHORIZED],
+  [ProviderMismatchError, HttpStatus.FORBIDDEN],
   [WalletNotFoundError, HttpStatus.NOT_FOUND],
   [WagerTransactionNotFoundError, HttpStatus.NOT_FOUND],
   [IdempotencyConflictError, HttpStatus.CONFLICT],
