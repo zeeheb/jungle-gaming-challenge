@@ -23,12 +23,17 @@ export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransaction | undefined>;
   findByIdempotencyKey(providerId: string, idempotencyKey: string): Promise<WagerTransaction | undefined>;
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
+  /** Transactions waiting for their reference whose next lookup is due, earliest first. Not locked. */
+  findDueForReferenceRetry(now: Date, limit: number): Promise<WagerTransaction[]>;
   /** Whether a processed REFUND or ROLLBACK already reverts this transaction. */
   isReversed(transactionId: string): Promise<boolean>;
   add(transaction: WagerTransaction): void;
+  /** Saves the state of a transaction loaded by this same unit of work. */
+  update(transaction: WagerTransaction): void;
 }
 
 export interface LedgerRepository {
+  /** The entry's transaction must already be added (or loaded) in this unit of work. */
   add(entry: WalletLedgerEntry): void;
 }
 

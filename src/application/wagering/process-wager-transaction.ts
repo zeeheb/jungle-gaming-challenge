@@ -1,9 +1,7 @@
 import type { EventContext } from '../../domain/events/wagering-events';
 import { InboxMessage } from '../../domain/messaging/inbox-message';
-import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { newId } from '../../domain/shared/id';
 import { computePayloadHash, type WagerPayload } from '../../domain/wagering/payload-hash';
-import { settleWager } from '../../domain/wagering/settle-wager';
 import { WagerTransaction } from '../../domain/wagering/wager-transaction';
 import {
   DuplicateTransactionError,
@@ -12,6 +10,7 @@ import {
   WalletNotFoundError,
 } from '../errors';
 import type { InboxRepository, Repositories, UnitOfWork, WagerTransactionRepository } from '../unit-of-work';
+import { settleAndRecord } from './settlement';
 
 /** Identifies the queue message that carried the request. */
 export interface InboxReceipt {
@@ -87,7 +86,7 @@ export class ProcessWagerTransaction {
     context: EventContext,
     receipt: InboxReceipt | undefined,
   ) {
-    const { wallets, transactions, ledger, outbox } = repositories;
+    const { wallets, transactions } = repositories;
 
     const wallet = await wallets.findByIdForUpdate(incoming.walletId);
     if (!wallet) {
@@ -105,24 +104,7 @@ export class ProcessWagerTransaction {
       return replayOrConflict(existing, incoming);
     }
 
-    const reference =
-      incoming.referenceExternalTransactionId === undefined
-        ? undefined
-        : await transactions.findByExternalId(incoming.providerId, incoming.referenceExternalTransactionId);
-    // Reversals of the reference live in the same wallet, so the lock covers them too.
-    const referenceAlreadyReversed =
-      reference !== undefined && incoming.requiresReference() && (await transactions.isReversed(reference.id));
-
-    const { entry, events } = settleWager({ wallet, transaction: incoming, reference, referenceAlreadyReversed, context });
-
-    transactions.add(incoming);
-    if (entry) {
-      ledger.add(entry);
-      wallets.update(wallet);
-    }
-    for (const event of events) {
-      outbox.add(OutboxMessage.enqueue(event));
-    }
+    await settleAndRecord(repositories, wallet, incoming, context, { isNew: true });
     return { transaction: incoming, replay: false };
   }
 }

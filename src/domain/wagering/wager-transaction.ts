@@ -330,6 +330,15 @@ export class WagerTransaction {
     return this._referenceAttempts >= REFERENCE_RETRY.maxAttempts;
   }
 
+  /** Waiting for its reference and the scheduled time of the next lookup has come. */
+  isDueForReferenceRetry(now: Date): boolean {
+    return (
+      this._status === WagerTransactionStatus.PendingReference &&
+      this._nextReferenceAttemptAt !== undefined &&
+      this._nextReferenceAttemptAt.getTime() <= now.getTime()
+    );
+  }
+
   matchesPayload(payloadHash: string): boolean {
     return this.payloadHash === payloadHash;
   }

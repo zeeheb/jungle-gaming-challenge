@@ -124,6 +124,18 @@ describe('WagerTransaction', () => {
       expect(() => wager({ kind: Kind.Bet }).markPendingReference(NOW)).toThrow(InvalidTransactionStateError);
     });
 
+    it('is due for a new lookup only once its scheduled time has come', () => {
+      const refund = wager({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
+      expect(refund.isDueForReferenceRetry(NOW)).toBe(false); // still PENDING
+
+      refund.markPendingReference(NOW); // next lookup in 1s
+      expect(refund.isDueForReferenceRetry(new Date(NOW.getTime() + 999))).toBe(false);
+      expect(refund.isDueForReferenceRetry(new Date(NOW.getTime() + 1_000))).toBe(true);
+
+      refund.reject(FailureCode.ReferenceNotFound, brl('0.00'), NOW);
+      expect(refund.isDueForReferenceRetry(new Date(NOW.getTime() + 1_000))).toBe(false);
+    });
+
     it('keeps the correlation id of the request that created it, outside the payload hash', () => {
       const a = wager({ externalTransactionId: 'same', correlationId: 'request-a' });
       const b = wager({ externalTransactionId: 'same', correlationId: 'request-b' });

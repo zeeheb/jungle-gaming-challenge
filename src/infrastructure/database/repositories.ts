@@ -101,18 +101,32 @@ function mutableWalletFields(wallet: Wallet) {
 }
 
 class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
+  // same bookkeeping as the wallets: update() edits the record behind a
+  // transaction this unit of work loaded
+  private readonly records = new WeakMap<WagerTransaction, WagerTransactionRecord>();
+
   constructor(private readonly em: EntityManager) {}
 
   async findById(id: string): Promise<WagerTransaction | undefined> {
-    return toTransaction(await this.em.findOne(WagerTransactionRecordSchema, { id }));
+    return this.track(await this.em.findOne(WagerTransactionRecordSchema, { id }));
   }
 
   async findByIdempotencyKey(providerId: string, idempotencyKey: string): Promise<WagerTransaction | undefined> {
-    return toTransaction(await this.em.findOne(WagerTransactionRecordSchema, { providerId, idempotencyKey }));
+    return this.track(await this.em.findOne(WagerTransactionRecordSchema, { providerId, idempotencyKey }));
   }
 
   async findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
-    return toTransaction(await this.em.findOne(WagerTransactionRecordSchema, { providerId, externalTransactionId }));
+    return this.track(await this.em.findOne(WagerTransactionRecordSchema, { providerId, externalTransactionId }));
+  }
+
+  async findDueForReferenceRetry(now: Date, limit: number): Promise<WagerTransaction[]> {
+    // served by the partial index wager_transactions_pending_reference_idx
+    const records = await this.em.find(
+      WagerTransactionRecordSchema,
+      { status: WagerTransactionStatus.PendingReference, nextReferenceAttemptAt: { $lte: now } },
+      { orderBy: { nextReferenceAttemptAt: 'asc', id: 'asc' }, limit },
+    );
+    return records.map((record) => this.track(record)!);
   }
 
   async isReversed(transactionId: string): Promise<boolean> {
@@ -125,7 +139,7 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
   }
 
   add(transaction: WagerTransaction): void {
-    this.em.create(WagerTransactionRecordSchema, {
+    const record = this.em.create(WagerTransactionRecordSchema, {
       id: transaction.id,
       providerId: transaction.providerId,
       externalTransactionId: transaction.externalTransactionId,
@@ -139,25 +153,47 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
       amount: amountOf(transaction.money),
       currency: transaction.money.currency,
       referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
-      referenceTransactionId: transaction.referenceTransactionId ?? null,
-      status: transaction.status,
-      failureCode: transaction.failureCode ?? null,
-      resultingBalance: transaction.resultingBalance ? amountOf(transaction.resultingBalance) : null,
-      resultingBalanceCurrency: transaction.resultingBalance?.currency ?? null,
-      referenceAttempts: transaction.referenceAttempts,
-      nextReferenceAttemptAt: transaction.nextReferenceAttemptAt ?? null,
       createdAt: transaction.createdAt,
-      processedAt: transaction.processedAt ?? null,
       correlationId: transaction.correlationId ?? null,
+      ...mutableTransactionFields(transaction),
     });
+    this.records.set(transaction, record);
+  }
+
+  update(transaction: WagerTransaction): void {
+    const record = this.records.get(transaction);
+    if (!record) {
+      throw new Error(`Transaction ${transaction.id} was not loaded by this unit of work`);
+    }
+    Object.assign(record, mutableTransactionFields(transaction));
+  }
+
+  private track(record: WagerTransactionRecord | null): WagerTransaction | undefined {
+    if (!record) {
+      return undefined;
+    }
+    const transaction = toTransaction(record);
+    this.records.set(transaction, record);
+    return transaction;
   }
 }
 
+/** What a transaction's transitions change. The database trigger rejects changes to anything else. */
+function mutableTransactionFields(transaction: WagerTransaction) {
+  return {
+    status: transaction.status,
+    referenceTransactionId: transaction.referenceTransactionId ?? null,
+    failureCode: transaction.failureCode ?? null,
+    resultingBalance: transaction.resultingBalance ? amountOf(transaction.resultingBalance) : null,
+    resultingBalanceCurrency: transaction.resultingBalance?.currency ?? null,
+    referenceAttempts: transaction.referenceAttempts,
+    nextReferenceAttemptAt: transaction.nextReferenceAttemptAt ?? null,
+    processedAt: transaction.processedAt ?? null,
+  };
+}
+
 // Status, kind and failure code are trusted as stored: CHECK constraints keep them valid.
-function toTransaction(record: WagerTransactionRecord | null): WagerTransaction | undefined {
-  if (!record) {
-    return undefined;
-  }
+function toTransaction(record: WagerTransactionRecord): WagerTransaction {
   const { resultingBalance, resultingBalanceCurrency } = record;
   return WagerTransaction.rehydrate({
     id: record.id,
@@ -191,6 +227,11 @@ class MikroOrmLedgerRepository implements LedgerRepository {
   constructor(private readonly em: EntityManager) {}
 
   add(entry: WalletLedgerEntry): void {
+    // Given only the transaction's id, the ORM would register a reference for it
+    // and later take the new transaction for an existing row (no INSERT).
+    if (!this.em.getUnitOfWork().getById(WagerTransactionRecordSchema, entry.transactionId)) {
+      throw new Error(`Add or load transaction ${entry.transactionId} before its ledger entry`);
+    }
     this.em.create(LedgerEntryRecordSchema, {
       id: entry.id,
       wallet: entry.walletId,
